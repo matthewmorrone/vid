@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def run_cli(args, env=None):
@@ -89,4 +89,28 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     for key in ["metadata","thumb","sprites","previews","subs","phash","heatmap","scenes"]:
         assert report_json["counts"][key] == 1, f"{key} missing in report"
         assert report_json["coverage"][key] == 1.0
+
+
+def test_queue_stub_mode(tmp_path: Path):
+    (tmp_path / "a.mp4").write_bytes(b"00")
+    (tmp_path / "b.mp4").write_bytes(b"0000")
+    env = {"FFPROBE_DISABLE": "1"}
+    proc = run_cli(["queue", str(tmp_path), "--workers", "2"], env)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "a.mp4.ffprobe.json").exists()
+    assert (tmp_path / "b.mp4.ffprobe.json").exists()
+
+
+def test_list_sort_show_size(tmp_path: Path):
+    big = tmp_path / "big.mp4"
+    small = tmp_path / "small.mp4"
+    big.write_bytes(b"0" * 10)
+    small.write_bytes(b"0" * 5)
+    proc = run_cli(["list", str(tmp_path), "--show-size", "--sort", "size"])
+    assert proc.returncode == 0
+    lines = [l for l in proc.stdout.splitlines() if l.endswith(".mp4")]
+    assert lines[0].startswith("big.mp4")
+    assert "10.0B" in lines[0]
+    assert lines[1].startswith("small.mp4")
+    assert "5.0B" in lines[1]
 
