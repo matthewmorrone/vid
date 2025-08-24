@@ -22,11 +22,17 @@ def test_health_and_videos(tmp_path):
         assert any(Path(p).name == "v.mp4" for p in body["videos"])
 
 
-def test_job_meta(tmp_path, monkeypatch):
+def test_job_meta_and_report(tmp_path, monkeypatch):
     monkeypatch.setenv("FFPROBE_DISABLE", "1")
     (tmp_path / "v.mp4").write_bytes(b"00")
     with TestClient(api.app) as client:
-        payload = {"task": "meta", "directory": str(tmp_path), "recursive": False, "force": True, "params": {}}
+        payload = {
+            "task": "meta",
+            "directory": str(tmp_path),
+            "recursive": False,
+            "force": True,
+            "params": {},
+        }
         r = client.post("/jobs", json=payload)
         assert r.status_code == 200
         job_id = r.json()["id"]
@@ -37,4 +43,8 @@ def test_job_meta(tmp_path, monkeypatch):
             time.sleep(0.1)
         else:
             raise AssertionError("job did not finish")
+        report = client.get("/report", params={"directory": str(tmp_path)})
+        assert report.status_code == 200
+        data = report.json()
+        assert data["counts"]["metadata"] == 1
     assert (tmp_path / "v.mp4.ffprobe.json").exists()
