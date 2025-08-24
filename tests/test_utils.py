@@ -2,8 +2,6 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from index import parse_time_spec, human_size
 
 
