@@ -1,13 +1,10 @@
 import time
-import sys
-from pathlib import Path
+
+
 
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import api
-
-
 def test_health_and_videos(tmp_path):
     with TestClient(api.app) as client:
         r = client.get("/health")
