@@ -39,9 +39,7 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
 from queue import Queue, Empty
-try:
-    import cv2
-except Exception:
+except ImportError:
     cv2 = None
 import numpy as np
 
