@@ -2769,13 +2769,17 @@ def cmd_meta(ns) -> int:
 
 
 
+def resolve_directory(ns):
+    """Consolidate logic for setting ns.directory from ns.dir."""
+    if getattr(ns, "dir", None):
+        # If ns.directory is missing or set to "." or None, use ns.dir
+        if not hasattr(ns, "directory") or ns.directory == "." or ns.directory is None:
+            ns.directory = ns.dir
+    return ns
+
 def main(argv: List[str] | None = None) -> int:
     ns = parse_args(argv or sys.argv[1:])
-    if getattr(ns, "dir", None) and hasattr(ns, "directory"):
-        if ns.directory == "." or ns.directory is None:
-            ns.directory = ns.dir
-    elif getattr(ns, "dir", None) and not hasattr(ns, "directory"):
-        ns.directory = ns.dir
+    ns = resolve_directory(ns)
     if ns.cmd == "list":
         return cmd_list(ns)
     if ns.cmd == "report":
