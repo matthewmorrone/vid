@@ -160,7 +160,12 @@ def find_videos(root: Path, recursive: bool = False, exts: set[str] | None = Non
     iterator = root.rglob("*") if recursive else root.iterdir()
     vids = []
     for p in iterator:
-        if p.is_file() and p.suffix.lower() in exts and ARTIFACTS_DIR not in p.parts:
+        # Exclude files that are immediate children of ARTIFACTS_DIR
+        if (
+            p.is_file()
+            and p.suffix.lower() in exts
+            and p.parent != ARTIFACTS_DIR
+        ):
             vids.append(p)
     vids.sort()
     return vids
