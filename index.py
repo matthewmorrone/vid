@@ -1931,9 +1931,7 @@ def cmd_actor_match(ns) -> int:
             break
         frame_count += 1
         try:
-            from deepface import DeepFace
-            reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=ns.detector, enforce_detection=True, align=True)
-        except Exception:
+        except (ValueError, RuntimeError):
             reps = []
         faces = reps if isinstance(reps, list) else [reps]
         if len(faces) == 0:
