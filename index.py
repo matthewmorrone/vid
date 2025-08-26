@@ -1641,9 +1641,9 @@ def detect_faces_stub(video: Path) -> list[dict]:
 
 def _ensure_openface_model() -> Path:
     """Download the OpenFace embedding model if not present."""
-    url = (
-        "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
-    )
+        url = (
+            "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
+        )
     cache = Path.home() / ".cache" / "vid"
     cache.mkdir(parents=True, exist_ok=True)
     model_path = cache / "openface.nn4.small2.v1.t7"
