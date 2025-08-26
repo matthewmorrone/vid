@@ -4,6 +4,21 @@ Unified Python script `index.py` to:
 1. List MP4 files
 2. Generate ffprobe metadata JSON files
 3. Run an ephemeral in-memory queue to batch metadata generation with limited concurrency
+4. Build and match actor face embeddings
+
+## Actor Recognition
+
+Dependencies:
+- [DeepFace](https://pypi.org/project/deepface/)
+- [OpenCV](https://pypi.org/project/opencv-python/)
+- [NumPy](https://pypi.org/project/numpy/)
+- [FFmpeg](https://ffmpeg.org/)
+
+Examples:
+```
+python index.py actor-build --people-dir people --model ArcFace --detector retinaface --embeddings gallery.npy --labels labels.json --verbose
+python index.py actor-match --video videos/sample.mp4 --embeddings gallery.npy --labels labels.json --model ArcFace --detector retinaface --retry-detectors mtcnn,opencv --sample-rate 1.0 --conf 0.40 --topk 3 --verbose
+```
 
 ## Commands
 ```
@@ -18,6 +33,9 @@ python index.py batch [dir] [-r] [--tasks meta,thumb] [--max-meta 3] [--max-thum
 python index.py phash [dir] [-r] [--time middle|60|25%] [--frames 5] [--algo ahash|dct] [--combine xor|majority|avg] [--workers 2] [--force] [--output-format json|text]
 python index.py heatmap [dir] [-r] [--interval 5.0] [--mode brightness|motion|both] [--png] [--workers 2] [--force] [--output-format json|text]
 python index.py scenes [dir] [-r] [--threshold 0.4] [--limit N] [--thumbs] [--clips] [--clip-duration 2.0] [--thumb-width 320] [--workers 2] [--force] [--output-format json|text]
+python index.py faces [dir] [-r] [--workers N] [--force] [--output-format json|text]
+python index.py actor-build --people-dir PEOPLE [--model ArcFace] [--detector retinaface] [--embeddings gallery.npy] [--labels labels.json] [--include-video] [--video-sample-rate 1.0] [--min-face-area 4096] [--blur-threshold 60.0]
+python index.py actor-match --video INPUT.mp4 [--embeddings gallery.npy] [--labels labels.json] [--model ArcFace] [--detector retinaface] [--retry-detectors mtcnn,opencv] [--sample-rate 1.0] [--topk 3] [--conf 0.40] [--min-face-area 4096] [--blur-threshold 60.0] [--out OUTPUT.json]
 python index.py codecs [dir] [-r] [--target-v h264] [--target-a aac] [--allowed-profiles list] [--workers 4] [--output-format json|text]
 python index.py transcode [dir] dest [-r] [--target-v h264] [--target-a aac] [--crf 28] [--v-bitrate 3000k] [--a-bitrate 128k] [--preset medium] [--hardware none|videotoolbox] [--drop-subs] [--workers 1] [--force] [--dry-run] [--output-format json|text]
 python index.py compare original.mp4 other.mp4 [--output-format json|text]
@@ -61,10 +79,13 @@ python index.py report [dir] [-r] [--output-format json|text]
 	Sample frames every `--interval` seconds to produce a lightweight timeline of brightness and/or motion (mean absolute frame diff) values. Writes `<video>.mp4.heatmap.json` (and optionally a small stripe visualization `<video>.mp4.heatmap.png` with `--png`). Useful for spotting dark sections, scene density, or high-action regions.
 
 `scenes`:
-	Detect scene boundaries using ffmpeg's scene change filter (select with `gt(scene,THRESHOLD)`). Produces `<video>.mp4.scenes.json` with marker times and scores; optionally generates per-scene thumbnail JPEGs and/or short clip previews inside a hidden directory `.<name>.mp4.scenes/`. Use `--threshold` to tune sensitivity (lower = more markers). Limit output with `--limit`.
+        Detect scene boundaries using the PySceneDetect library's content detector. Produces `<video>.mp4.scenes.json` with marker times and scores; optionally generates per-scene thumbnail JPEGs and/or short clip previews inside a hidden directory `.<name>.mp4.scenes/`. Use `--threshold` to tune sensitivity (lower = more markers). Limit output with `--limit`.
+
+`faces`:
+        Detect faces using OpenCV's Haar cascade and generate 128-d embeddings via the OpenFace model, outputting `<video>.mp4.faces.json` with time-stamped bounding boxes and descriptors. Falls back to placeholder data when OpenCV or a readable video is unavailable.
 
 `codecs`:
-	Scan video files (mp4/mkv/mov/avi/webm/m4v) and list container, video codec/profile, audio codecs, size, duration, and whether they match target constraints. Supports JSON or text output. Useful pre-pass before deciding what to transcode.
+        Scan video files (mp4/mkv/mov/avi/webm/m4v) and list container, video codec/profile, audio codecs, size, duration, and whether they match target constraints. Supports JSON or text output. Useful pre-pass before deciding what to transcode.
 
 `transcode`:
 	Batch transcode incompatible (or all with `--force`) videos into a normalized MP4 (default H.264 + AAC) tree mirroring source structure. Supports CRF/preset software encoders and optional VideoToolbox hardware acceleration. Dry-run mode plans actions without encoding.
@@ -94,7 +115,7 @@ python index.py subs ./videos -r --model small --backend auto --format vtt
 - 2 invalid directory
 
 ## Development
-No external dependencies besides `ffprobe` (part of ffmpeg) for real metadata. Install via your package manager (e.g., `brew install ffmpeg`).
+Requires `ffprobe` (part of ffmpeg) for real metadata, PySceneDetect for scene boundary detection, and OpenCV (`opencv-python-headless`) for face detection/embeddings. Install via your package manager (e.g., `brew install ffmpeg`) and `pip install -r requirements.txt`.
 
 ### Consolidation
 
@@ -123,9 +144,10 @@ Initial endpoints:
 - `GET /jobs` – List jobs
 - `GET /jobs/{id}` – Job detail
 
-Supported job tasks: meta, thumb, sprites, previews, subs, phash, heatmap, scenes, codecs, transcode, report
+Supported job tasks: meta, thumb, sprites, previews, subs, phash, heatmap, scenes, faces, codecs, transcode, report
 
-Jobs are executed in-memory (ephemeral). Future enhancements (not yet implemented): cancellation, progress streaming (SSE/WebSocket), persistent queue, ML tasks (faces/performers), dedupe.
+Jobs are executed in-memory (ephemeral). Future enhancements (not yet implemented): cancellation, progress streaming (SSE/WebSocket), persistent queue, ML tasks (performer recognition), dedupe.
 
 ## License
 MIT (add a LICENSE file if distributing).
+Test change for PR flow — no functional code changes.
