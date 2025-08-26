@@ -124,7 +124,7 @@ ARTIFACTS_DIR = ".artifacts"
 
 def artifact_dir(media_path: Path) -> Path:
     d = media_path.parent / ARTIFACTS_DIR
-    d.mkdir(exist_ok=True)
+    d.mkdir(exist_ok=True, parents=True)
     return d
 
 def subtitles_path_candidates(media_path: Path):
