@@ -1618,7 +1618,7 @@ def cmd_scenes(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def faces_json_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".faces.json")
+    return video.with_suffix(f"{video.suffix}.faces.json")
 
 
 def l2norm(x: np.ndarray) -> np.ndarray:
