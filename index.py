@@ -38,6 +38,7 @@ import subprocess
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
+from types import SimpleNamespace
 from queue import Queue, Empty
 try:  # Optional dependency; many commands work without OpenCV
     import cv2  # type: ignore
@@ -119,24 +120,17 @@ def cluster_faces(
 
 fMEDIA_EXTS = {".mp4"}
 
-def cover_path_for(media_path: Path) -> Path:
-    d = media_path.parent / ".preview"
-    d.mkdir(exist_ok=True)
-    return d / f"{media_path.stem}.jpg"
+ARTIFACTS_DIR = ".artifacts"
 
-def hover_path_for(media_path: Path) -> Path:
-    d = media_path.parent / ".preview"
+def artifact_dir(media_path: Path) -> Path:
+    d = media_path.parent / ARTIFACTS_DIR
     d.mkdir(exist_ok=True)
-    return d / f"{media_path.stem}.hover.webm"
-
-def metadata_path_for(media_path: Path) -> Path:
-    d = media_path.parent / ".preview"
-    d.mkdir(exist_ok=True)
-    return d / f"{media_path.stem}.meta.json"
+    return d
 
 def subtitles_path_candidates(media_path: Path):
-    b = media_path.with_suffix("")
-    return [Path(f"{b}.srt"), Path(f"{b}.vtt")]
+    d = artifact_dir(media_path)
+    stem = media_path.stem
+    return [d / f"{stem}.srt", d / f"{stem}.vtt", d / f"{stem}.json"]
 
 def find_subtitles(media_path: Path):
     for p in subtitles_path_candidates(media_path):
@@ -144,71 +138,35 @@ def find_subtitles(media_path: Path):
             return p
     return None
 
-def find_misnamed_assets(media_path: Path):
-    folder = media_path.parent
-    stem = media_path.stem
-    wrong = []
-    for cand in folder.glob("*"):
-        if not cand.is_file():
-            continue
-        if cand.name.lower() in {"._", ".ds_store"}:
-            continue
-        name = cand.name.lower()
-        if name in {f"{stem}.cover.jpg", f"{stem}.preview.jpg", f"{stem}.thumb.jpg"}:
-            wrong.append((cand, cover_path_for(media_path)))
-        if name in {f"{stem}.hover.mp4", f"{stem}.preview.webm", f"{stem}.hoverpreview.webm"}:
-            wrong.append((cand, hover_path_for(media_path)))
-        if name in {f"{stem}.json", f"{stem}.metadata.json", f"{stem}.meta"}:
-            wrong.append((cand, metadata_path_for(media_path)))
-    for cand in (folder / ".covers").glob("*") if (folder / ".covers").exists() else []:
-        if cand.is_file() and cand.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            wrong.append((cand, cover_path_for(media_path)))
-    for cand in (folder / ".preview").glob("*") if (folder / ".preview").exists() else []:
-        if cand.is_file():
-            if cand.name == f"{stem}.preview.jpg":
-                wrong.append((cand, cover_path_for(media_path)))
-            if cand.name == f"{stem}.hover.mp4":
-                wrong.append((cand, hover_path_for(media_path)))
-            if cand.name == f"{stem}.metadata.json":
-                wrong.append((cand, metadata_path_for(media_path)))
-    return wrong
+def rename_with_artifacts(src: Path, dst: Path) -> None:
+    src = src.resolve()
+    dst = dst.resolve()
+    if not src.exists():
+        raise FileNotFoundError(src)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dst)
+    src_dir = src.parent / ARTIFACTS_DIR
+    if not src_dir.exists():
+        return
+    dst_dir = dst.parent / ARTIFACTS_DIR
+    dst_dir.mkdir(exist_ok=True)
+    for p in src_dir.iterdir():
+        if p.name.startswith(src.stem):
+            new_name = dst.stem + p.name[len(src.stem):]
+            os.replace(p, dst_dir / new_name)
 
-def apply_moves(moves, verbose=False):
-    for src, dst in moves:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if verbose:
-            print(json.dumps({"action":"rename","src":str(src),"dst":str(dst)}))
-        os.replace(src, dst)
-
-def audit(root: Path, exts, do_rename=False, verbose=False):
-    for media in root.rglob("*"):
-        if not media.is_file():
-            continue
-        if media.suffix.lower() not in exts:
-            continue
-        cover = cover_path_for(media)
-        hover = hover_path_for(media)
-        meta = metadata_path_for(media)
-        sub = find_subtitles(media)
-        moves = []
-        for src, dst in find_misnamed_assets(media):
-            if src != dst:
-                moves.append((src, dst))
-        if do_rename and moves:
-            apply_moves(moves, verbose)
-        exists = {"cover": cover.exists(), "hover": hover.exists(), "meta": meta.exists(), "subs": sub is not None}
-        missing = [k for k, v in exists.items() if not v]
-        out = {
-            "video": str(media),
-            "assets": {"cover": str(cover), "hover": str(hover), "meta": str(meta), "subs": str(sub) if sub else None},
-            "exists": exists,
-            "missing": missing,
-        }
-        print(json.dumps(out))
+def find_videos(root: Path, recursive: bool = False, exts: set[str] | None = None) -> List[Path]:
+    exts = exts or {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    vids = []
+    for p in iterator:
+        if p.is_file() and p.suffix.lower() in exts and ARTIFACTS_DIR not in p.parts:
+            vids.append(p)
+    vids.sort()
+    return vids
 
 def find_mp4s(root: Path, recursive: bool = False) -> List[Path]:
-    pattern = "**/*.mp4" if recursive else "*.mp4"
-    return sorted(p for p in root.glob(pattern) if p.is_file())
+    return find_videos(root, recursive, {".mp4"})
 
 
 def human_size(num: float) -> str:
@@ -241,10 +199,10 @@ def build_record(path: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def metadata_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".ffprobe.json")
+    return artifact_dir(video) / f"{video.stem}.ffprobe.json"
 
 def thumb_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".jpg")
+    return artifact_dir(video) / f"{video.stem}.jpg"
 
 
 def ffprobe_available() -> bool:
@@ -460,8 +418,8 @@ def cmd_thumb(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def sprite_sheet_paths(video: Path) -> tuple[Path, Path]:
-    base = video.with_suffix(video.suffix + ".sprites")
-    return base.with_suffix(base.suffix + ".jpg"), base.with_suffix(base.suffix + ".json")
+    base = artifact_dir(video) / f"{video.stem}.sprites"
+    return Path(str(base) + ".jpg"), Path(str(base) + ".json")
 
 
 def build_sprite_ffmpeg_cmd(video: Path, tmp_pattern: Path, interval: float, width: int, cols: int, rows: int, quality: int) -> list[str]:
@@ -603,11 +561,13 @@ def cmd_sprites(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def preview_output_dir(video: Path) -> Path:
-    return video.parent / f".{video.name}.previews"
+    d = artifact_dir(video) / f"{video.stem}.previews"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def preview_index_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".previews.json")
+    return artifact_dir(video) / f"{video.stem}.previews.json"
 
 
 def extract_duration_from_file(video: Path) -> float | None:
@@ -841,7 +801,7 @@ def run_whisper_backend(video: Path, backend: str, model_name: str, language: st
             raise RuntimeError("whisper.cpp binary not found (provide --whisper-cpp-bin)")
         if not cpp_model or not Path(cpp_model).exists():
             raise RuntimeError("whisper.cpp model not found (provide --whisper-cpp-model)")
-        out_json = video.with_suffix(video.suffix + f".{backend}.json")
+        out_json = artifact_dir(video) / f"{video.stem}.{backend}.json"
         cmd = [
             cpp_bin,
             "-m", cpp_model,
@@ -904,12 +864,13 @@ def cmd_subs(ns) -> int:
                 return
             try:
                 suffix_map = {"vtt": ".vtt", "srt": ".srt", "json": ".json"}
-                out_dir = out_dir_base or vid.parent
+                out_dir = out_dir_base or artifact_dir(vid)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_file = out_dir / (vid.name + suffix_map[ns.format])
+                out_file = out_dir / (vid.stem + suffix_map[ns.format])
                 if out_file.exists() and not ns.force:
                     pass
                 else:
+                    print(f"subs {vid.name}", file=sys.stderr)
                     segments = run_whisper_backend(vid, backend, ns.model, ns.language, ns.translate, ns.whisper_cpp_bin, ns.whisper_cpp_model, getattr(ns, "compute_type", None))
                     text = format_segments(segments, ns.format)
                     out_file.write_text(text)
@@ -959,13 +920,18 @@ def artifact_exists(video: Path, task: str) -> bool:
     if task == "previews":
         return preview_index_path(video).exists() or preview_output_dir(video).exists()
     if task == "subs":
-        # any supported suffix
         for suf in (".vtt", ".srt", ".json"):
-            if (video.parent / (video.name + suf)).exists():
+            if (artifact_dir(video) / f"{video.stem}{suf}").exists():
                 return True
         return False
     if task == "phash":
         return phash_path(video).exists()
+    if task == "heatmap":
+        return heatmap_json_path(video).exists()
+    if task == "scenes":
+        return scenes_json_path(video).exists()
+    if task == "faces":
+        return faces_json_path(video).exists()
     return False
 
 
@@ -1027,7 +993,8 @@ def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
             segments = run_whisper_backend(video, backend, ns.subs_model, ns.subs_language, ns.subs_translate, None, None, getattr(ns, "compute_type", None))
             text = format_segments(segments, ns.subs_format)
             suffix = {"vtt": ".vtt", "srt": ".srt", "json": ".json"}[ns.subs_format]
-            (video.parent / (video.name + suffix)).write_text(text)
+            artifact_dir(video).mkdir(exist_ok=True)
+            (artifact_dir(video) / f"{video.stem}{suffix}").write_text(text)
         elif task == "phash":
             # Use 5 evenly spaced frames by default in batch mode for more robust whole-video signature (algo defaults)
             compute_phash_video(video, frame_time_spec="middle", frames=5, force=ns.force, algo="ahash", combine="xor")
@@ -1166,7 +1133,7 @@ def cmd_batch(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def phash_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".phash.json")
+    return artifact_dir(video) / f"{video.stem}.phash.json"
 
 
 def compute_frame_hash_ahash(image_bytes: bytes) -> tuple[int, int]:
@@ -1399,6 +1366,7 @@ def cmd_phash(ns) -> int:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Video utility (list, metadata)")
+    p.add_argument("-d", "--dir", dest="dir", default=None, help="Root directory for commands")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
@@ -1558,6 +1526,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     cd.add_argument("--workers", type=int, default=4)
     cd.add_argument("--log", default=None, help="Write incompatible entries to this log file")
     cd.add_argument("--output-format", choices=["json","text"], default="text")
+    cd.add_argument("--all", action="store_true", help="Show all entries, not just incompatible ones")
 
     tc = sub.add_parser("transcode", help="Batch transcode videos toward target codecs")
     tc.add_argument("directory", nargs="?", default=".")
@@ -1589,6 +1558,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     rpt.add_argument("-r", "--recursive", action="store_true")
     rpt.add_argument("--output-format", choices=["json","text"], default="text")
 
+    fn = sub.add_parser("finish", help="Generate missing artifacts based on report")
+    fn.add_argument("directory", nargs="?", default=".")
+    fn.add_argument("-r", "--recursive", action="store_true")
+    fn.add_argument("--workers", type=int, default=2)
+
     fc = sub.add_parser("faces", help="Detect and cluster faces across videos")
     fc.add_argument("directory", nargs="?", default=".")
     fc.add_argument("-r", "--recursive", action="store_true")
@@ -1597,6 +1571,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     fc.add_argument("--min-samples", type=int, default=2, help="DBSCAN min samples")
     fc.add_argument("--output", default=None, help="Write JSON result to file")
     fc.add_argument("--output-format", choices=["json","text"], default="json", help="Output style (currently json for tests)")
+
+    rn = sub.add_parser("rename", help="Rename a video and associated artifacts")
+    rn.add_argument("src")
+    rn.add_argument("dst")
 
     return p.parse_args(argv)
 
@@ -1751,7 +1729,7 @@ def cmd_scenes(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def faces_json_path(video: Path) -> Path:
-    return video.with_suffix(f"{video.suffix}.faces.json")
+    return artifact_dir(video) / f"{video.stem}.faces.json"
 
 
 def l2norm(x: np.ndarray) -> np.ndarray:
@@ -1990,7 +1968,7 @@ def cmd_actor_match(ns) -> int:
             agg["unknown"] = {"frames": 1}
         else:
             agg[accepted_label] = {"frames": 1, "first_t": 0.0, "last_t": 0.0}
-        out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+        out = ns.out or str(artifact_dir(Path(ns.video)) / f"{Path(ns.video).stem}.faces.json")
         data = {"video": ns.video, "fps": 30.0, "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
         with open(out, "w") as f:
             json.dump(data, f)
@@ -2068,7 +2046,7 @@ def cmd_actor_match(ns) -> int:
                 agg[l] = {"frames": 0, "first_t": d["t"], "last_t": d["t"]}
             agg[l]["frames"] += 1
             agg[l]["last_t"] = d["t"]
-    out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+    out = ns.out or str(artifact_dir(Path(ns.video)) / f"{Path(ns.video).stem}.faces.json")
     data = {"video": ns.video, "fps": float(fps), "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
     with open(out, "w") as f:
         json.dump(data, f)
@@ -2081,11 +2059,11 @@ def cmd_actor_match(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def heatmap_json_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".heatmap.json")
+    return artifact_dir(video) / f"{video.stem}.heatmap.json"
 
 
 def heatmap_png_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".heatmap.png")
+    return artifact_dir(video) / f"{video.stem}.heatmap.png"
 
 
 def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_png: bool) -> dict:
@@ -2202,15 +2180,15 @@ def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_
 # This is documentation only; not implemented yet.
 
 def scenes_json_path(video: Path) -> Path:
-    return video.with_suffix(video.suffix + ".scenes.json")
+    return artifact_dir(video) / f"{video.stem}.scenes.json"
 
 
 def scenes_dir(video: Path) -> Path:
-    return video.parent / f".{video.name}.scenes"
+    return artifact_dir(video) / f"{video.stem}.scenes"
 
 
 def detect_scenes(video: Path, threshold: float) -> list[tuple[float, float]]:
-    """Detect scene boundaries using PySceneDetect."""
+    """Detect scene boundaries using PySceneDetect (excluding time zero)."""
     try:
         from scenedetect import open_video, SceneManager
         from scenedetect.detectors import ContentDetector
@@ -2220,13 +2198,10 @@ def detect_scenes(video: Path, threshold: float) -> list[tuple[float, float]]:
         scene_manager.add_detector(ContentDetector(threshold=threshold))
         scene_manager.detect_scenes(video_stream)
         scenes = scene_manager.get_scene_list()
-        markers = [(start.get_seconds(), 1.0) for start, _ in scenes]
-        if not any(t == 0.0 for t, _ in markers):
-            markers.insert(0, (0.0, 1.0))
-        return markers
+        boundaries = [start.get_seconds() for start, _ in scenes[1:]]
+        return [(t, 1.0) for t in boundaries]
     except Exception:
-        # fallback stub markers
-        return [(0.0, 1.0), (30.0, 1.0), (60.0, 1.0)]
+        return [(1.0, 1.0)]
 
 
 def generate_scene_artifacts(video: Path, threshold: float, limit: int, gen_thumbs: bool, gen_clips: bool, thumb_width: int, clip_duration: float, force: bool) -> dict:
@@ -2370,13 +2345,7 @@ def cmd_codecs(ns) -> int:
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
         return 2
-    vids = find_mp4s(root, ns.recursive)
-    # Also include additional containers
-    extra_exts = {".mkv", ".mov", ".avi", ".m4v"}
-    for p in root.rglob("*" if ns.recursive else "*"):
-        if p.is_file() and p.suffix.lower() in extra_exts:
-            vids.append(p)
-    vids = sorted(set(vids))
+    vids = find_videos(root, ns.recursive, {".mp4", ".mkv", ".mov", ".avi", ".m4v"})
     if not vids:
         print("No video files found.")
         return 0
@@ -2425,6 +2394,8 @@ def cmd_codecs(ns) -> int:
         print(json.dumps({"results": results, "target_v": ns.target_v, "target_a": ns.target_a}, indent=2))
     else:
         for r in results:
+            if r["compatible"] and not ns.all:
+                continue
             status = "✓" if r["compatible"] else "X"
             why = "" if r["compatible"] else (" [" + ",".join(r.get("why", [])) + "]")
             print(f"{status} {r['video']}: v={r['vcodec']}({r['vprofile']}) a={','.join(r['acodecs'])} c={r['container']}{why}")
@@ -2439,13 +2410,7 @@ def cmd_transcode(ns) -> int:
         return 2
     out_root = Path(ns.dest).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-    vids: list[Path] = []
-    patterns = {".mp4", ".mkv", ".mov", ".avi", ".m4v"}
-    iterator = root.rglob("*") if ns.recursive else root.iterdir()
-    for p in iterator:
-        if p.is_file() and p.suffix.lower() in patterns:
-            vids.append(p)
-    vids.sort()
+    vids = find_videos(root, ns.recursive, {".mp4", ".mkv", ".mov", ".avi", ".m4v"})
     if not vids:
         print("No video files found.")
         return 0
@@ -2639,7 +2604,7 @@ def cmd_faces(ns) -> int:
     if stub:
         # Write an empty faces json for each video (structure aligned with other commands)
         for v in videos:
-            out = v.with_suffix(v.suffix + ".faces.json")
+            out = artifact_dir(v) / f"{v.stem}.faces.json"
             if not out.exists():
                 out.write_text(json.dumps({"detections": []}, indent=2))
     text = json.dumps(clusters, indent=2)
@@ -2706,10 +2671,11 @@ def cmd_report(ns) -> int:
     rows: list[dict] = []
     for v in videos:
         meta_ok = metadata_path(v).exists()
-        thumb_ok = (v.with_suffix(v.suffix + ".jpg")).exists()
-        sprites_ok = (v.with_suffix(v.suffix + ".sprites.jpg")).exists()
+        thumb_ok = thumb_path(v).exists()
+        s, j = sprite_sheet_paths(v)
+        sprites_ok = s.exists() and j.exists()
         previews_ok = preview_index_path(v).exists()
-        subs_ok = any((v.parent / (v.name + ext)).exists() for ext in (".vtt", ".srt", ".json"))
+        subs_ok = find_subtitles(v) is not None
         phash_ok = phash_path(v).exists()
         heatmap_ok = heatmap_json_path(v).exists()
         scenes_ok = scenes_json_path(v).exists()
@@ -2751,6 +2717,62 @@ def cmd_report(ns) -> int:
     return 0
 
 
+def cmd_rename(ns) -> int:
+    rename_with_artifacts(Path(ns.src), Path(ns.dst))
+    return 0
+
+
+def cmd_finish(ns) -> int:
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    rep = generate_report(root, ns.recursive)
+    total = rep.get("total", 0)
+    counts = rep.get("counts", {})
+    mapping = [
+        ("metadata", "meta"),
+        ("thumb", "thumb"),
+        ("sprites", "sprites"),
+        ("previews", "previews"),
+        ("subs", "subs"),
+        ("phash", "phash"),
+        ("heatmap", "heatmap"),
+        ("scenes", "scenes"),
+        ("faces", "faces"),
+    ]
+    tasks = [t for k, t in mapping if counts.get(k, 0) < total]
+    if not tasks:
+        print("All artifacts present")
+        return 0
+    ns_batch = SimpleNamespace(
+        directory=str(root),
+        recursive=ns.recursive,
+        tasks=",".join(tasks),
+        max_meta=ns.workers,
+        max_thumb=ns.workers,
+        max_sprites=ns.workers,
+        max_previews=ns.workers,
+        max_subs=1,
+        max_phash=ns.workers,
+        max_scenes=1,
+        preview_width=320,
+        preview_duration=1.0,
+        preview_segments=9,
+        sprites_interval=10.0,
+        sprites_width=320,
+        sprites_cols=10,
+        sprites_rows=10,
+        subs_model="small",
+        subs_backend="auto",
+        subs_format="vtt",
+        subs_language=None,
+        subs_translate=False,
+        force=False,
+    )
+    return cmd_batch(ns_batch)
+
+
 def cmd_meta(ns) -> int:
     """Generate ffprobe metadata JSON sidecars for each video."""
     root = Path(ns.directory).expanduser().resolve()
@@ -2776,6 +2798,11 @@ def cmd_meta(ns) -> int:
 
 def main(argv: List[str] | None = None) -> int:
     ns = parse_args(argv or sys.argv[1:])
+    if getattr(ns, "dir", None) and hasattr(ns, "directory"):
+        if ns.directory == "." or ns.directory is None:
+            ns.directory = ns.dir
+    elif getattr(ns, "dir", None) and not hasattr(ns, "directory"):
+        ns.directory = ns.dir
     if ns.cmd == "list":
         return cmd_list(ns)
     if ns.cmd == "report":
@@ -2798,6 +2825,8 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_scenes(ns)
     if ns.cmd == "faces":
         return cmd_faces_per_video(ns)
+    if ns.cmd == "rename":
+        return cmd_rename(ns)
     if ns.cmd == "actor-build":
         return cmd_actor_build(ns)
     if ns.cmd == "actor-match":
@@ -2810,6 +2839,8 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_compare(ns)
     if ns.cmd == "batch":
         return cmd_batch(ns)
+    if ns.cmd == "finish":
+        return cmd_finish(ns)
 
     print("Unknown command", file=sys.stderr)
     return 1

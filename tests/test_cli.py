@@ -43,33 +43,33 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     # meta
     r_meta = run_cli(["meta", str(tmp_path)], env)
     assert r_meta.returncode == 0, r_meta.stderr
-    assert (tmp_path / "sample.mp4.ffprobe.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.ffprobe.json").exists()
 
     # thumb
     r_thumb = run_cli(["thumb", str(tmp_path)], env)
     assert r_thumb.returncode == 0, r_thumb.stderr
-    assert (tmp_path / "sample.mp4.jpg").exists()
+    assert (tmp_path / ".artifacts" / "sample.jpg").exists()
 
     # sprites
     r_sprites = run_cli(["sprites", str(tmp_path)], env)
     assert r_sprites.returncode == 0, r_sprites.stderr
-    assert (tmp_path / "sample.mp4.sprites.jpg").exists()
-    assert (tmp_path / "sample.mp4.sprites.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.sprites.jpg").exists()
+    assert (tmp_path / ".artifacts" / "sample.sprites.json").exists()
 
     # previews
     r_prev = run_cli(["previews", str(tmp_path)], env)
     assert r_prev.returncode == 0, r_prev.stderr
-    assert (tmp_path / "sample.mp4.previews.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.previews.json").exists()
 
     # subs (default vtt)
     r_subs = run_cli(["subs", str(tmp_path)], env)
     assert r_subs.returncode == 0, r_subs.stderr
-    assert (tmp_path / "sample.mp4.vtt").exists()
+    assert (tmp_path / ".artifacts" / "sample.vtt").exists()
 
     # phash
     r_phash = run_cli(["phash", str(tmp_path), "--frames", "1", "--output-format", "json"], env)
     assert r_phash.returncode == 0, r_phash.stderr
-    phash_file = tmp_path / "sample.mp4.phash.json"
+    phash_file = tmp_path / ".artifacts" / "sample.phash.json"
     assert phash_file.exists()
     phash_data = json.loads(phash_file.read_text())
     assert "phash" in phash_data
@@ -77,17 +77,17 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     # heatmap
     r_heat = run_cli(["heatmap", str(tmp_path), "--output-format", "json"], env)
     assert r_heat.returncode == 0, r_heat.stderr
-    assert (tmp_path / "sample.mp4.heatmap.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.heatmap.json").exists()
 
     # scenes
     r_scenes = run_cli(["scenes", str(tmp_path), "--output-format", "json"], env)
     assert r_scenes.returncode == 0, r_scenes.stderr
-    assert (tmp_path / "sample.mp4.scenes.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.scenes.json").exists()
 
     # faces
     r_faces = run_cli(["faces", str(tmp_path), "--output-format", "json"], env)
     assert r_faces.returncode == 0, r_faces.stderr
-    assert (tmp_path / "sample.mp4.faces.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.faces.json").exists()
 
     # report
     r_report = run_cli(["report", str(tmp_path), "--output-format", "json"], env)
@@ -113,7 +113,7 @@ def test_actor_build_and_match_stub(tmp_path: Path):
     video.write_bytes(b"00")
     r_match = run_cli(["actor-match", "--video", str(video), "--embeddings", str(emb), "--labels", str(lab)], env)
     assert r_match.returncode == 0, r_match.stderr
-    faces_file = tmp_path / "v.mp4.faces.json"
+    faces_file = tmp_path / ".artifacts" / "v.faces.json"
     assert faces_file.exists()
     data = json.loads(faces_file.read_text())
     assert data["detections"][0]["accepted_label"] == "A"
@@ -127,8 +127,8 @@ def test_meta_parallel_stub_mode(tmp_path: Path):
     env = {"FFPROBE_DISABLE": "1"}
     proc = run_cli(["meta", str(tmp_path), "--workers", "2"], env)
     assert proc.returncode == 0, proc.stderr
-    assert (tmp_path / "a.mp4.ffprobe.json").exists()
-    assert (tmp_path / "b.mp4.ffprobe.json").exists()
+    assert (tmp_path / ".artifacts" / "a.ffprobe.json").exists()
+    assert (tmp_path / ".artifacts" / "b.ffprobe.json").exists()
 
 
 def test_list_sort_show_size(tmp_path: Path):
