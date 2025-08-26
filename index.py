@@ -5,7 +5,7 @@ Functions:
   list   - List .mp4 files with optional recursion / JSON / sizes.
   meta   - Generate ffprobe metadata JSON files for .mp4s.
            (Skips existing unless --force.)
-  queue  - Queue + process metadata generation with limited workers.
+  
 
 The 'queue' command is an ephemeral in-memory scheduler to avoid CPU thrash on
 low-power devices. It discovers files (like meta) then processes them with a
@@ -39,7 +39,9 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
 from queue import Queue, Empty
-except ImportError:
+try:  # Optional dependency; many commands work without OpenCV
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover - fallback when opencv-python not installed
     cv2 = None
 import numpy as np
 
@@ -51,12 +53,165 @@ random.seed(0)
 # File discovery & listing
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Merged helpers (from faces.py & find_misnamed_assets.py)
+# ---------------------------------------------------------------------------
+
+def cluster_faces(
+    videos: Iterable[Path],
+    frame_rate: float = 1.0,
+    eps: float = 0.5,
+    min_samples: int = 2,
+):
+    """Detect faces in videos and cluster them by similarity.
+
+    Requires optional heavy deps: opencv-python, face_recognition, scikit-learn.
+    Returns dict[label] -> list occurrences {video, timestamp, bbox{top,right,bottom,left}}.
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+        from sklearn.cluster import DBSCAN  # type: ignore
+        import face_recognition  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("face clustering requires cv2, face_recognition and scikit-learn") from exc
+    embeddings = []
+    occurrences = []
+    for video in videos:
+        cap = cv2.VideoCapture(str(video))
+        if not cap.isOpened():
+            cap.release()
+            continue
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        step = max(int(round(fps / frame_rate)), 1)
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                rgb = frame[:, :, ::-1]
+                boxes = face_recognition.face_locations(rgb)
+                if boxes:
+                    encs = face_recognition.face_encodings(rgb, boxes)
+                    ts = frame_idx / fps
+                    for (top, right, bottom, left), enc in zip(boxes, encs):
+                        embeddings.append(enc)
+                        occurrences.append({
+                            "video": Path(video).name,
+                            "timestamp": ts,
+                            "bbox": {"top": int(top), "right": int(right), "bottom": int(bottom), "left": int(left)},
+                        })
+            frame_idx += 1
+        cap.release()
+    if not embeddings:
+        return {}
+    import numpy as np  # type: ignore
+    data = np.vstack(embeddings)
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    normalized = data / norms
+    labels = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean").fit_predict(normalized)
+    clusters = {}
+    for label, occ in zip(labels, occurrences):
+        clusters.setdefault(int(label), []).append(occ)
+    return clusters
+
+fMEDIA_EXTS = {".mp4"}
+
+def cover_path_for(media_path: Path) -> Path:
+    d = media_path.parent / ".preview"
+    d.mkdir(exist_ok=True)
+    return d / f"{media_path.stem}.jpg"
+
+def hover_path_for(media_path: Path) -> Path:
+    d = media_path.parent / ".preview"
+    d.mkdir(exist_ok=True)
+    return d / f"{media_path.stem}.hover.webm"
+
+def metadata_path_for(media_path: Path) -> Path:
+    d = media_path.parent / ".preview"
+    d.mkdir(exist_ok=True)
+    return d / f"{media_path.stem}.meta.json"
+
+def subtitles_path_candidates(media_path: Path):
+    b = media_path.with_suffix("")
+    return [Path(f"{b}.srt"), Path(f"{b}.vtt")]
+
+def find_subtitles(media_path: Path):
+    for p in subtitles_path_candidates(media_path):
+        if p.exists():
+            return p
+    return None
+
+def find_misnamed_assets(media_path: Path):
+    folder = media_path.parent
+    stem = media_path.stem
+    wrong = []
+    for cand in folder.glob("*"):
+        if not cand.is_file():
+            continue
+        if cand.name.lower() in {"._", ".ds_store"}:
+            continue
+        name = cand.name.lower()
+        if name in {f"{stem}.cover.jpg", f"{stem}.preview.jpg", f"{stem}.thumb.jpg"}:
+            wrong.append((cand, cover_path_for(media_path)))
+        if name in {f"{stem}.hover.mp4", f"{stem}.preview.webm", f"{stem}.hoverpreview.webm"}:
+            wrong.append((cand, hover_path_for(media_path)))
+        if name in {f"{stem}.json", f"{stem}.metadata.json", f"{stem}.meta"}:
+            wrong.append((cand, metadata_path_for(media_path)))
+    for cand in (folder / ".covers").glob("*") if (folder / ".covers").exists() else []:
+        if cand.is_file() and cand.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+            wrong.append((cand, cover_path_for(media_path)))
+    for cand in (folder / ".preview").glob("*") if (folder / ".preview").exists() else []:
+        if cand.is_file():
+            if cand.name == f"{stem}.preview.jpg":
+                wrong.append((cand, cover_path_for(media_path)))
+            if cand.name == f"{stem}.hover.mp4":
+                wrong.append((cand, hover_path_for(media_path)))
+            if cand.name == f"{stem}.metadata.json":
+                wrong.append((cand, metadata_path_for(media_path)))
+    return wrong
+
+def apply_moves(moves, verbose=False):
+    for src, dst in moves:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if verbose:
+            print(json.dumps({"action":"rename","src":str(src),"dst":str(dst)}))
+        os.replace(src, dst)
+
+def audit(root: Path, exts, do_rename=False, verbose=False):
+    for media in root.rglob("*"):
+        if not media.is_file():
+            continue
+        if media.suffix.lower() not in exts:
+            continue
+        cover = cover_path_for(media)
+        hover = hover_path_for(media)
+        meta = metadata_path_for(media)
+        sub = find_subtitles(media)
+        moves = []
+        for src, dst in find_misnamed_assets(media):
+            if src != dst:
+                moves.append((src, dst))
+        if do_rename and moves:
+            apply_moves(moves, verbose)
+        exists = {"cover": cover.exists(), "hover": hover.exists(), "meta": meta.exists(), "subs": sub is not None}
+        missing = [k for k, v in exists.items() if not v]
+        out = {
+            "video": str(media),
+            "assets": {"cover": str(cover), "hover": str(hover), "meta": str(meta), "subs": str(sub) if sub else None},
+            "exists": exists,
+            "missing": missing,
+        }
+        print(json.dumps(out))
+
 def find_mp4s(root: Path, recursive: bool = False) -> List[Path]:
     pattern = "**/*.mp4" if recursive else "*.mp4"
     return sorted(p for p in root.glob(pattern) if p.is_file())
 
 
-def human_size(num: int) -> str:
+def human_size(num: float) -> str:
     if num < 0:
         return "?"
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -173,63 +328,7 @@ def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int 
     print(f"Progress: {done}/{total}", file=sys.stderr)
     return {"total": total, "errors": errors}
 
-# ---------------------------------------------------------------------------
-# Queue (ephemeral) built atop metadata generation logic
-# ---------------------------------------------------------------------------
-
-class EphemeralQueue:
-    def __init__(self, paths: List[Path]):
-        self._all = paths
-        self._lock = threading.Lock()
-        self._index = 0
-
-    def next(self) -> Path | None:
-        with self._lock:
-            if self._index >= len(self._all):
-                return None
-            p = self._all[self._index]
-            self._index += 1
-            return p
-
-
-def queue_process(paths: List[Path], workers: int, force: bool) -> Dict[str, Any]:
-    total = len(paths)
-    q = EphemeralQueue(paths)
-    errors: list[str] = []
-    processed = 0
-    lock = threading.Lock()
-
-    def worker():
-        nonlocal processed
-        while True:
-            p = q.next()
-            if p is None:
-                return
-            try:
-                out_path = metadata_path(p)
-                if out_path.exists() and not force:
-                    pass
-                else:
-                    data = run_ffprobe(p)
-                    out_path.write_text(json.dumps(data, indent=2))
-            except Exception as e:  # noqa: BLE001
-                with lock:
-                    errors.append(f"{p}: {e}")
-            finally:
-                with lock:
-                    processed += 1
-
-    worker_count = max(1, min(workers, 4))
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(worker_count)]
-    for t in threads:
-        t.start()
-    while any(t.is_alive() for t in threads):
-        print(f"Queue progress: {processed}/{total}\r", end="", file=sys.stderr)
-        time.sleep(0.25)
-    for t in threads:
-        t.join()
-    print(f"Queue progress: {processed}/{total}", file=sys.stderr)
-    return {"total": total, "errors": errors}
+ 
 
 # ---------------------------------------------------------------------------
 # Thumbnail generation
@@ -262,7 +361,10 @@ def extract_duration(meta_json: Dict[str, Any]) -> float | None:
     if isinstance(fmt, dict):
         dur = fmt.get("duration")
         try:
-            return float(dur)
+            if dur is not None:
+                return float(dur)
+            else:
+                return None
         except (TypeError, ValueError):
             return None
     return None
@@ -302,6 +404,7 @@ def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -
 
 
 def cmd_thumb(ns) -> int:
+    """Generate a single thumbnail per video (time chosen by --time) in parallel workers."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -466,6 +569,7 @@ def generate_sprite_sheet(video: Path, interval: float, width: int, cols: int, r
 
 
 def cmd_sprites(ns) -> int:
+    """Create sprite sheet + JSON index (grid of frames) for each video."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -546,6 +650,7 @@ def build_preview_cmd(video: Path, start: float, duration: float, width: int, ou
 
 
 def cmd_previews(ns) -> int:
+    """Generate short hover preview clips (segmented) and an index JSON."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -687,25 +792,48 @@ def format_segments(segments, fmt: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def run_whisper_backend(video: Path, backend: str, model_name: str, language: str | None, translate: bool, cpp_bin: str | None, cpp_model: str | None):
+def run_whisper_backend(video: Path, backend: str, model_name: str, language: str | None, translate: bool, cpp_bin: str | None, cpp_model: str | None, compute_type: str | None = None):
     # Returns list of segments: {start,end,text}
+    # compute_type: for faster-whisper (auto|int8|int8_float16|int16|float16|float32). We'll attempt fallback if unsupported.
     if os.environ.get("FFPROBE_DISABLE"):
         return [{"start": i * 2.0, "end": i * 2.0 + 1.5, "text": f"Stub segment {i+1}"} for i in range(3)]
     if backend == "faster-whisper":
         from faster_whisper import WhisperModel  # type: ignore
-        model = WhisperModel(model_name, compute_type="int8" if translate else "float16")
-        seg_iter, info = model.transcribe(str(video), language=language, task="translate" if translate else "transcribe")
-        segments = []
-        for s in seg_iter:
-            segments.append({"start": s.start, "end": s.end, "text": s.text})
-        return segments
+        # Choose initial compute type: explicit flag > translate heuristic > default float16
+        initial_type = compute_type or ("int8" if translate else "float16")
+        tried: list[str] = []
+        fallback_chain = [initial_type]
+        # If user forced a type we still may fallback if it errors.
+        if initial_type != "int8":
+            fallback_chain.append("int8")
+        if initial_type not in ("float32", "int16"):
+            fallback_chain.append("float32")  # last resort correctness over speed
+        last_err: Exception | None = None
+        for ct in fallback_chain:
+            try:
+                tried.append(ct)
+                model = WhisperModel(model_name, compute_type=ct)
+                seg_iter, _info = model.transcribe(str(video), language=language, task="translate" if translate else "transcribe")
+                segments = []
+                for s in seg_iter:
+                    segments.append({"start": s.start, "end": s.end, "text": s.text})
+                if ct != initial_type:
+                    print(f"[subs] compute_type fallback: {initial_type} -> {ct}", file=sys.stderr)
+                return segments
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                # Try next fallback
+                continue
+        # All attempts failed
+        raise RuntimeError(f"faster-whisper failed (tried {tried}): {last_err}")
     if backend == "whisper":
         import whisper  # type: ignore
         model = whisper.load_model(model_name)
         result = model.transcribe(str(video), language=language, task="translate" if translate else "transcribe")
         segs = []
         for s in result.get("segments", []):
-            segs.append({"start": s["start"], "end": s["end"], "text": s["text"]})
+            if isinstance(s, dict):
+                segs.append({"start": s.get("start"), "end": s.get("end"), "text": s.get("text")})
         return segs
     if backend == "whisper.cpp":
         # Need external binary invocation; minimal implementation.
@@ -747,6 +875,7 @@ def run_whisper_backend(video: Path, backend: str, model_name: str, language: st
 
 
 def cmd_subs(ns) -> int:
+    """Generate subtitles via whisper/whisper.cpp (stubbed when FFPROBE_DISABLE set)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -781,7 +910,7 @@ def cmd_subs(ns) -> int:
                 if out_file.exists() and not ns.force:
                     pass
                 else:
-                    segments = run_whisper_backend(vid, backend, ns.model, ns.language, ns.translate, ns.whisper_cpp_bin, ns.whisper_cpp_model)
+                    segments = run_whisper_backend(vid, backend, ns.model, ns.language, ns.translate, ns.whisper_cpp_bin, ns.whisper_cpp_model, getattr(ns, "compute_type", None))
                     text = format_segments(segments, ns.format)
                     out_file.write_text(text)
             except Exception as e:  # noqa: BLE001
@@ -895,7 +1024,7 @@ def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
             }, indent=2))
         elif task == "subs":
             backend = detect_backend(ns.subs_backend)
-            segments = run_whisper_backend(video, backend, ns.subs_model, ns.subs_language, ns.subs_translate, None, None)
+            segments = run_whisper_backend(video, backend, ns.subs_model, ns.subs_language, ns.subs_translate, None, None, getattr(ns, "compute_type", None))
             text = format_segments(segments, ns.subs_format)
             suffix = {"vtt": ".vtt", "srt": ".srt", "json": ".json"}[ns.subs_format]
             (video.parent / (video.name + suffix)).write_text(text)
@@ -925,6 +1054,7 @@ def meta_single(video: Path, force: bool) -> bool:
 
 
 def cmd_batch(ns) -> int:
+    """Run a batch of artifact generators (meta, thumb, sprites, previews, subs) together."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1205,6 +1335,7 @@ def compute_phash_video(video: Path, frame_time_spec: str, frames: int, force: b
 
 
 def cmd_phash(ns) -> int:
+    """Compute perceptual hash (single or multi-frame combined) for duplicates detection."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1267,7 +1398,7 @@ def cmd_phash(ns) -> int:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Video utility (list, metadata, queue)")
+    p = argparse.ArgumentParser(description="Video utility (list, metadata)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
@@ -1277,17 +1408,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     lp.add_argument("--show-size", action="store_true")
     lp.add_argument("--sort", choices=["name", "size"], default="name")
 
-    mp = sub.add_parser("meta", help="Generate ffprobe metadata for mp4 files")
+    mp = sub.add_parser("meta", help="Generate ffprobe metadata for mp4 files (multi-threaded)")
     mp.add_argument("directory", nargs="?", default=".")
     mp.add_argument("-r", "--recursive", action="store_true")
     mp.add_argument("--force", action="store_true", help="Regenerate even if output exists")
     mp.add_argument("--workers", type=int, default=1)
-
-    qp = sub.add_parser("queue", help="Ephemeral queue to generate metadata")
-    qp.add_argument("directory", nargs="?", default=".")
-    qp.add_argument("-r", "--recursive", action="store_true")
-    qp.add_argument("--force", action="store_true")
-    qp.add_argument("--workers", type=int, default=1)
 
     tp = sub.add_parser("thumb", help="Generate cover thumbnails (JPEG)")
     tp.add_argument("directory", nargs="?", default=".")
@@ -1334,6 +1459,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sb.add_argument("--output-dir", default=None, help="Directory to place subtitle files (defaults alongside videos)")
     sb.add_argument("--whisper-cpp-bin", default=None, help="Path to whisper.cpp binary (if backend whisper.cpp)")
     sb.add_argument("--whisper-cpp-model", default=None, help="Path to whisper.cpp model (.bin)")
+    sb.add_argument("--compute-type", default=None, help="faster-whisper compute type override (auto=int8 if translate else float16). Fallbacks applied if unsupported.")
 
     bt = sub.add_parser("batch", help="Ephemeral multi-stage pipeline (meta/thumb/sprites/previews/subs) with per-type concurrency caps")
     bt.add_argument("directory", nargs="?", default=".")
@@ -1394,12 +1520,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sc.add_argument("--force", action="store_true")
     sc.add_argument("--output-format", choices=["json","text"], default="json")
 
-    fc = sub.add_parser("faces", help="Detect faces in videos")
-    fc.add_argument("directory", nargs="?", default=".")
-    fc.add_argument("-r", "--recursive", action="store_true")
-    fc.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
-    fc.add_argument("--force", action="store_true")
-    fc.add_argument("--output-format", choices=["json","text"], default="json")
+    # (Removed earlier simple 'faces' detector parser to avoid duplicate name conflict.)
 
     ab = sub.add_parser("actor-build", help="Build face embedding gallery")
     ab.add_argument("--people-dir", required=True)
@@ -1475,11 +1596,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     fc.add_argument("--eps", type=float, default=0.5, help="DBSCAN eps parameter")
     fc.add_argument("--min-samples", type=int, default=2, help="DBSCAN min samples")
     fc.add_argument("--output", default=None, help="Write JSON result to file")
+    fc.add_argument("--output-format", choices=["json","text"], default="json", help="Output style (currently json for tests)")
 
     return p.parse_args(argv)
 
 
 def cmd_list(ns) -> int:
+    """List .mp4 files with optional size sorting / JSON output."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1505,6 +1628,7 @@ def cmd_list(ns) -> int:
 
 
 def cmd_heatmap(ns) -> int:
+    """Compute brightness & motion heatmap timeline (JSON, optional PNG)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1564,6 +1688,7 @@ def cmd_heatmap(ns) -> int:
 
 
 def cmd_scenes(ns) -> int:
+    """Detect scene boundaries (FFmpeg select filter) and optionally thumbs/clips."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1649,9 +1774,9 @@ def detect_faces_stub(video: Path) -> list[dict]:
 
 def _ensure_openface_model() -> Path:
     """Download the OpenFace embedding model if not present."""
-        url = (
-            "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
-        )
+    url = (
+        "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
+    )
     cache = Path.home() / ".cache" / "vid"
     cache.mkdir(parents=True, exist_ok=True)
     model_path = cache / "openface.nn4.small2.v1.t7"
@@ -1682,6 +1807,7 @@ def detect_faces(video: Path, interval: float = 1.0) -> list[dict]:
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         step = max(int(fps * interval), 1)
+        import cv2.data
         cascade = cv2.CascadeClassifier(
             f"{cv2.data.haarcascades}haarcascade_frontalface_default.xml"
         )
@@ -1738,70 +1864,12 @@ def generate_faces(video: Path, force: bool) -> dict:
     out_json.write_text(json.dumps(data, indent=2))
     return data
 
-
-def cmd_faces(ns) -> int:
-    root = Path(ns.directory).expanduser().resolve()
-    if not root.is_dir():
-        print(f"Error: directory not found: {root}", file=sys.stderr)
-        return 2
-    videos = find_mp4s(root, ns.recursive)
-    if not videos:
-        print("No MP4 files found.")
-        return 0
-    worker_count = max(1, min(ns.workers, 4))
-    q: Queue[Path] = Queue()
-    for v in videos:
-        q.put(v)
-    done = 0
-    total = len(videos)
-    lock = threading.Lock()
-    errors: list[str] = []
-    results: list[tuple[str, dict]] = []
-
-    def worker():
-        nonlocal done
-        while True:
-            try:
-                vid = q.get_nowait()
-            except Empty:
-                return
-            try:
-                data = generate_faces(vid, ns.force)
-                with lock:
-                    results.append((vid.name, data))
-            except Exception as e:  # noqa: BLE001
-                with lock:
-                    errors.append(f"{vid.name}: {e}")
-            finally:
-                with lock:
-                    done += 1
-                    print(f"faces {done}/{total}\r", end="", file=sys.stderr)
-                q.task_done()
-
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(worker_count)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    print(f"faces {done}/{total}", file=sys.stderr)
-    if errors:
-        for e in errors:
-            print("Error:", e, file=sys.stderr)
-    if ns.output_format == "json":
-        print(json.dumps({"results": [
-            {"video": v, "count": len(d.get("faces", [])), "faces": d.get("faces")}
-            for v, d in results
-        ]}, indent=2))
-    else:
-        for v, d in results:
-            print(v, len(d.get("faces", [])))
-    return 1 if errors else 0
-
 # ---------------------------------------------------------------------------
 # Actor recognition
 # ---------------------------------------------------------------------------
 
 def cmd_actor_build(ns) -> int:
+    """Build face embedding gallery from people directory (optionally sample videos)."""
     img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     vid_exts = {".mp4"}
     embeddings: list[np.ndarray] = []
@@ -1822,11 +1890,16 @@ def cmd_actor_build(ns) -> int:
                     labels.append(actor)
                     counts[actor] = counts.get(actor, 0) + 1
                     continue
+                if cv2 is None:
+                    continue  # OpenCV not available, skip image processing
                 img = cv2.imread(str(path))
                 if img is None:
                     continue
                 try:
-                except (ValueError, RuntimeError):
+                    # Attempt to use DeepFace if available (lazy import to avoid heavy startup in tests)
+                    from deepface import DeepFace  # type: ignore
+                    reps = DeepFace.represent(img_path=str(path), model_name=ns.model, detector_backend=ns.detector, enforce_detection=False)
+                except Exception:  # broad: fall back to empty reps (stub)
                     reps = []
                 faces = reps if isinstance(reps, list) else [reps]
                 for face in faces:
@@ -1837,7 +1910,7 @@ def cmd_actor_build(ns) -> int:
                     crop = img[y:y + h, x:x + w]
                     if crop.size == 0:
                         continue
-                    if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
+                    if cv2 is not None and cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
                         continue
                     embeddings.append(np.array(face["embedding"], dtype="float32"))
                     labels.append(actor)
@@ -1845,6 +1918,8 @@ def cmd_actor_build(ns) -> int:
             elif ns.include_video and ext in vid_exts:
                 if stub:
                     continue
+                if cv2 is None:
+                    continue  # OpenCV not available, skip video processing
                 cap = cv2.VideoCapture(str(path))
                 if not cap.isOpened():
                     continue
@@ -1893,6 +1968,7 @@ def cmd_actor_build(ns) -> int:
 
 
 def cmd_actor_match(ns) -> int:
+    """Match faces in a single video against previously built gallery."""
     gallery = np.load(ns.embeddings).astype("float32")
     with open(ns.labels) as f:
         labels = json.load(f)
@@ -1921,6 +1997,9 @@ def cmd_actor_match(ns) -> int:
         if getattr(ns, "verbose", False):
             print(1, 1, out)
         return 0
+    if cv2 is None:
+        print("OpenCV (cv2) is not installed. Please install opencv-python.", file=sys.stderr)
+        return 1
     cap = cv2.VideoCapture(ns.video)
     if not cap.isOpened():
         print("Cannot open video")
@@ -1939,13 +2018,17 @@ def cmd_actor_match(ns) -> int:
             break
         frame_count += 1
         try:
-        except (ValueError, RuntimeError):
+            from deepface import DeepFace  # type: ignore
+            reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=ns.detector, enforce_detection=False)
+        except Exception:
             reps = []
         faces = reps if isinstance(reps, list) else [reps]
         if len(faces) == 0:
             for det in retry:
                 try:
-                except (ValueError, RuntimeError):
+                    from deepface import DeepFace  # type: ignore
+                    reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=det, enforce_detection=False)
+                except Exception:
                     reps = []
                 faces = reps if isinstance(reps, list) else [reps]
                 if len(faces) > 0:
@@ -2083,20 +2166,20 @@ def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_
                 row = [int(min(255, max(0, s["brightness"])) ) for s in samples]
                 img = Image.new("L", (w, 1))
                 img.putdata(row)
-                img = img.resize((w, 32), resample=Image.NEAREST)
+                img = img.resize((w, 32), resample=Image.Resampling.NEAREST)
                 img.save(heatmap_png_path(video))
             elif mode == "motion":
                 row = [int(min(255, max(0, (s["motion"] or 0) * 255))) for s in samples]
                 img = Image.new("L", (w, 1))
                 img.putdata(row)
-                img = img.resize((w, 32), resample=Image.NEAREST)
+                img = img.resize((w, 32), resample=Image.Resampling.NEAREST)
                 img.save(heatmap_png_path(video))
             else:  # both -> two rows stacked
                 row1 = [int(min(255, max(0, s["brightness"])) ) for s in samples]
                 row2 = [int(min(255, max(0, (s["motion"] or 0) * 255))) for s in samples]
                 img = Image.new("L", (w, 2))
                 img.putdata(row1 + row2)
-                img = img.resize((w, 64), resample=Image.NEAREST)
+                img = img.resize((w, 64), resample=Image.Resampling.NEAREST)
                 img.save(heatmap_png_path(video))
         except Exception:
             pass
@@ -2282,13 +2365,14 @@ def build_transcode_cmd(src: Path, dst: Path, target_v: str, target_a: str, crf:
 
 
 def cmd_codecs(ns) -> int:
+    """Scan videos for codec/profile compatibility vs desired target codecs."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
         return 2
     vids = find_mp4s(root, ns.recursive)
     # Also include additional containers
-    extra_exts = {".mkv", ".mov", ".avi", ".webm", ".m4v"}
+    extra_exts = {".mkv", ".mov", ".avi", ".m4v"}
     for p in root.rglob("*" if ns.recursive else "*"):
         if p.is_file() and p.suffix.lower() in extra_exts:
             vids.append(p)
@@ -2341,13 +2425,14 @@ def cmd_codecs(ns) -> int:
         print(json.dumps({"results": results, "target_v": ns.target_v, "target_a": ns.target_a}, indent=2))
     else:
         for r in results:
-            status = "OK" if r["compatible"] else "X"
+            status = "✓" if r["compatible"] else "X"
             why = "" if r["compatible"] else (" [" + ",".join(r.get("why", [])) + "]")
             print(f"{status} {r['video']}: v={r['vcodec']}({r['vprofile']}) a={','.join(r['acodecs'])} c={r['container']}{why}")
     return 0
 
 
 def cmd_transcode(ns) -> int:
+    """Transcode incompatible videos toward target codecs (supports dry-run & progress)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -2355,7 +2440,7 @@ def cmd_transcode(ns) -> int:
     out_root = Path(ns.dest).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     vids: list[Path] = []
-    patterns = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+    patterns = {".mp4", ".mkv", ".mov", ".avi", ".m4v"}
     iterator = root.rglob("*") if ns.recursive else root.iterdir()
     for p in iterator:
         if p.is_file() and p.suffix.lower() in patterns:
@@ -2462,6 +2547,7 @@ def cmd_transcode(ns) -> int:
 
 
 def cmd_compare(ns) -> int:
+    """Compare two videos computing SSIM & PSNR quality metrics."""
     src = Path(ns.original).expanduser().resolve()
     dst = Path(ns.other).expanduser().resolve()
     if not src.exists() or not dst.exists():
@@ -2536,27 +2622,65 @@ def cmd_compare(ns) -> int:
 
 
 def cmd_faces(ns) -> int:
+    """Cluster faces across videos (heavy deps) or stub output when disabled."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
         return 2
     videos = find_mp4s(root, ns.recursive)
-    from faces import cluster_faces
     clusters = cluster_faces(
         videos,
         frame_rate=ns.frame_rate,
         eps=ns.eps,
         min_samples=ns.min_samples,
     )
+    # In stub/offline test mode (FFPROBE_DISABLE) also write a simple per-video artifact
+    stub = os.environ.get("FFPROBE_DISABLE")
+    if stub:
+        # Write an empty faces json for each video (structure aligned with other commands)
+        for v in videos:
+            out = v.with_suffix(v.suffix + ".faces.json")
+            if not out.exists():
+                out.write_text(json.dumps({"detections": []}, indent=2))
     text = json.dumps(clusters, indent=2)
-    if ns.output:
-        Path(ns.output).write_text(text)
+    if ns.output_format == "json":
+        if ns.output:
+            Path(ns.output).write_text(text)
+        else:
+            print(text)
     else:
-        print(text)
+        # simple text summary
+        for cid, occs in clusters.items():
+            print(cid, len(occs))
     return 0
+
+def cmd_faces_per_video(ns) -> int:
+    """Detect faces in each video individually and write per-video .faces.json files."""
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    videos = find_mp4s(root, ns.recursive)
+    if not videos:
+        print("No MP4 files found.")
+        return 0
+    errors: list[str] = []
+    for v in videos:
+        try:
+            generate_faces(v, force=getattr(ns, "force", False))
+            print(f"Faces detected for {v.name}")
+        except Exception as e:
+            errors.append(f"{v}: {e}")
+    if errors:
+        print("Errors (some faces missing):", file=sys.stderr)
+        for e in errors:
+            print("  " + e, file=sys.stderr)
+    print(f"Faces detection done for {len(videos) - len(errors)} file(s)")
+    return 0 if not errors else 1
 
 
 def cmd_report(ns) -> int:
+    """Summarize artifact coverage (counts & percentages) across videos."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -2628,6 +2752,7 @@ def cmd_report(ns) -> int:
 
 
 def cmd_meta(ns) -> int:
+    """Generate ffprobe metadata JSON sidecars for each video."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -2647,34 +2772,16 @@ def cmd_meta(ns) -> int:
     return 0
 
 
-def cmd_queue(ns) -> int:
-    root = Path(ns.directory).expanduser().resolve()
-    if not root.is_dir():
-        print(f"Error: directory not found: {root}", file=sys.stderr)
-        return 2
-    if not ffprobe_available():
-        print("Warning: ffprobe not found; set FFPROBE_DISABLE=1 to stub or install ffprobe", file=sys.stderr)
-    videos = find_mp4s(root, ns.recursive)
-    if not videos:
-        print("No MP4 files found.")
-        return 0
-    result = queue_process(videos, workers=ns.workers, force=ns.force)
-    if result["errors"]:
-        print("Errors (some files may be incomplete):", file=sys.stderr)
-        for e in result["errors"]:
-            print("  " + e, file=sys.stderr)
-    print(f"Queue done for {result['total']} file(s)")
-    return 0
 
 
 def main(argv: List[str] | None = None) -> int:
     ns = parse_args(argv or sys.argv[1:])
     if ns.cmd == "list":
         return cmd_list(ns)
+    if ns.cmd == "report":
+        return cmd_report(ns)
     if ns.cmd == "meta":
         return cmd_meta(ns)
-    if ns.cmd == "queue":
-        return cmd_queue(ns)
     if ns.cmd == "thumb":
         return cmd_thumb(ns)
     if ns.cmd == "sprites":
@@ -2683,8 +2790,6 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_previews(ns)
     if ns.cmd == "subs":
         return cmd_subs(ns)
-    if ns.cmd == "batch":
-        return cmd_batch(ns)
     if ns.cmd == "phash":
         return cmd_phash(ns)
     if ns.cmd == "heatmap":
@@ -2692,7 +2797,7 @@ def main(argv: List[str] | None = None) -> int:
     if ns.cmd == "scenes":
         return cmd_scenes(ns)
     if ns.cmd == "faces":
-        return cmd_faces(ns)
+        return cmd_faces_per_video(ns)
     if ns.cmd == "actor-build":
         return cmd_actor_build(ns)
     if ns.cmd == "actor-match":
@@ -2703,8 +2808,9 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_transcode(ns)
     if ns.cmd == "compare":
         return cmd_compare(ns)
-    if ns.cmd == "report":
-        return cmd_report(ns)
+    if ns.cmd == "batch":
+        return cmd_batch(ns)
+
     print("Unknown command", file=sys.stderr)
     return 1
 

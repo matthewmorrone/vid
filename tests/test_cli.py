@@ -121,11 +121,11 @@ def test_actor_build_and_match_stub(tmp_path: Path):
     resp = client.get(f"/videos/{video.name}/faces", params={"directory": str(tmp_path)})
     assert resp.status_code == 200
     assert resp.json()["detections"][0]["accepted_label"] == "A"
-def test_queue_stub_mode(tmp_path: Path):
+def test_meta_parallel_stub_mode(tmp_path: Path):
     (tmp_path / "a.mp4").write_bytes(b"00")
     (tmp_path / "b.mp4").write_bytes(b"0000")
     env = {"FFPROBE_DISABLE": "1"}
-    proc = run_cli(["queue", str(tmp_path), "--workers", "2"], env)
+    proc = run_cli(["meta", str(tmp_path), "--workers", "2"], env)
     assert proc.returncode == 0, proc.stderr
     assert (tmp_path / "a.mp4.ffprobe.json").exists()
     assert (tmp_path / "b.mp4.ffprobe.json").exists()
