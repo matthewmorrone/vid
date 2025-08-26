@@ -280,13 +280,14 @@ def video_artifacts(name: str, directory: str = Query(".")):
     path = root / name
     if not path.exists():
         raise HTTPException(404, "video not found")
+    s, j = index.sprite_sheet_paths(path)
     return {
         "video": name,
         "metadata": index.metadata_path(path).exists(),
-        "thumb": (path.with_suffix(path.suffix + ".jpg")).exists(),
-        "sprites": (path.with_suffix(path.suffix + ".sprites.jpg")).exists(),
+        "thumb": index.thumb_path(path).exists(),
+        "sprites": s.exists() and j.exists(),
         "previews": index.preview_index_path(path).exists(),
-        "subs": any((path.parent / (path.name + ext)).exists() for ext in (".vtt", ".srt", ".json")),
+        "subs": index.find_subtitles(path) is not None,
         "phash": index.phash_path(path).exists(),
         "heatmap": hasattr(index, 'heatmap_json_path') and index.heatmap_json_path(path).exists(),
         "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),
