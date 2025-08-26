@@ -22,6 +22,7 @@ python index.py codecs [dir] [-r] [--target-v h264] [--target-a aac] [--allowed-
 python index.py transcode [dir] dest [-r] [--target-v h264] [--target-a aac] [--crf 28] [--v-bitrate 3000k] [--a-bitrate 128k] [--preset medium] [--hardware none|videotoolbox] [--drop-subs] [--workers 1] [--force] [--dry-run] [--output-format json|text]
 python index.py compare original.mp4 other.mp4 [--output-format json|text]
 python index.py report [dir] [-r] [--output-format json|text]
+python index.py faces [dir] [-r] [--frame-rate 1.0] [--eps 0.5] [--min-samples 2] [--output faces.json]
 ```
 
 `list`:
@@ -70,10 +71,15 @@ python index.py report [dir] [-r] [--output-format json|text]
 	Batch transcode incompatible (or all with `--force`) videos into a normalized MP4 (default H.264 + AAC) tree mirroring source structure. Supports CRF/preset software encoders and optional VideoToolbox hardware acceleration. Dry-run mode plans actions without encoding.
 
 `compare`:
-	Compute SSIM and PSNR between two files (original vs other) and classify quality levels.
+        Compute SSIM and PSNR between two files (original vs other) and classify quality levels.
 
 `report`:
-	Summarize library artifact coverage: counts & percentages for metadata, thumbnail, sprites, previews, subtitles, phash, heatmap, scenes. Outputs per-file presence matrix (JSON mode) or a concise table (text mode).
+        Summarize library artifact coverage: counts & percentages for metadata, thumbnail, sprites, previews, subtitles, phash, heatmap, scenes. Outputs per-file presence matrix (JSON mode) or a concise table (text mode).
+
+`faces`:
+        Detect faces, generate embeddings and cluster recurring faces using DBSCAN. Outputs JSON mapping of cluster IDs to occurrences (video name, timestamp, bounding box) for later manual labeling.
+        Requires `opencv-python`, `face_recognition`, and `scikit-learn`.
+
 
 Set `FFPROBE_DISABLE=1` to produce stub metadata JSON without calling ffprobe (useful on systems lacking ffprobe or for tests).
 
