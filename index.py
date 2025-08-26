@@ -718,7 +718,7 @@ def detect_backend(preference: str) -> str:
     return "whisper.cpp"  # assume external binary
 
 
-def format_segments(segments) -> str:
+def format_segments(segments: List[Dict[str, Any]]) -> str:
     lines = []
     for i, s in enumerate(segments, start=1):
         def ts(t):
