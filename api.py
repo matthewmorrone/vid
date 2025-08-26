@@ -19,7 +19,7 @@ NOTES / FUTURE (not yet implemented):
 - Real-time progress via SSE/WebSocket (hook into per-file loops in index)
 - Cancellable jobs & persistent queue (SQLite)
 - Separate worker process pool for CPU isolation
-- ML tasks (faces / performers) after base API stabilizes
+- ML tasks (performer recognition) after base API stabilizes
 """
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ _jobs: Dict[str, JobRecord] = {}
 _jobs_lock = threading.Lock()
 
 ALLOWED_TASKS = {
-    "meta", "thumb", "sprites", "previews", "subs", "phash", "heatmap", "scenes", "codecs", "transcode", "report"
+    "meta", "thumb", "sprites", "previews", "subs", "phash", "heatmap", "scenes", "faces", "actor-build", "actor-match", "codecs", "transcode", "report"
 }
 
 # ---------------------------------------------------------------------------
@@ -159,6 +159,40 @@ class JobExecutor(threading.Thread):
             ns.thumb_width = params.get("thumb_width", 320)
             ns.output_format = "json"
             return index.cmd_scenes(ns)
+        if task == "faces":
+            ns.output_format = "json"
+            return index.cmd_faces(ns)
+        if task == "actor-build":
+            ns = SimpleNamespace(
+                people_dir=params.get("people_dir"),
+                model=params.get("model", "ArcFace"),
+                detector=params.get("detector", "retinaface"),
+                embeddings=params.get("embeddings", "gallery.npy"),
+                labels=params.get("labels", "labels.json"),
+                include_video=params.get("include_video", False),
+                video_sample_rate=params.get("video_sample_rate", 1.0),
+                min_face_area=params.get("min_face_area", 4096),
+                blur_threshold=params.get("blur_threshold", 60.0),
+                verbose=params.get("verbose", False),
+            )
+            return index.cmd_actor_build(ns)
+        if task == "actor-match":
+            ns = SimpleNamespace(
+                video=params.get("video"),
+                embeddings=params.get("embeddings", "gallery.npy"),
+                labels=params.get("labels", "labels.json"),
+                model=params.get("model", "ArcFace"),
+                detector=params.get("detector", "retinaface"),
+                retry_detectors=params.get("retry_detectors", "mtcnn,opencv"),
+                sample_rate=params.get("sample_rate", 1.0),
+                topk=params.get("topk", 3),
+                conf=params.get("conf", 0.40),
+                min_face_area=params.get("min_face_area", 4096),
+                blur_threshold=params.get("blur_threshold", 60.0),
+                out=params.get("out"),
+                verbose=params.get("verbose", False),
+            )
+            return index.cmd_actor_match(ns)
         if task == "codecs":
             ns.target_v = params.get("target_v", "h264")
             ns.target_a = params.get("target_a", "aac")
@@ -188,7 +222,7 @@ class JobExecutor(threading.Thread):
 def generate_report(root: Path, recursive: bool) -> dict:
     videos = index.find_mp4s(root, recursive)
     total = len(videos)
-    counts = {k: 0 for k in ("metadata","thumb","sprites","previews","subs","phash","heatmap","scenes")}
+    counts = {k: 0 for k in ("metadata","thumb","sprites","previews","subs","phash","heatmap","scenes","faces")}
     for v in videos:
         if index.metadata_path(v).exists(): counts["metadata"] += 1
         if (v.with_suffix(v.suffix + ".jpg")).exists(): counts["thumb"] += 1
@@ -202,6 +236,10 @@ def generate_report(root: Path, recursive: bool) -> dict:
             pass
         try:
             if index.scenes_json_path(v).exists(): counts["scenes"] += 1
+        except Exception:
+            pass
+        try:
+            if index.faces_json_path(v).exists(): counts["faces"] += 1
         except Exception:
             pass
     coverage = {k: (counts[k] / total if total else 0.0) for k in counts}
@@ -252,6 +290,7 @@ def video_artifacts(name: str, directory: str = Query(".")):
         "phash": index.phash_path(path).exists(),
         "heatmap": hasattr(index, 'heatmap_json_path') and index.heatmap_json_path(path).exists(),
         "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),
+        "faces": hasattr(index, 'faces_json_path') and index.faces_json_path(path).exists(),
     }
 
 
@@ -268,6 +307,18 @@ def video_metadata(name: str, directory: str = Query(".")):
         return json.loads(meta_file.read_text())
     except Exception:
         return {"raw": meta_file.read_text()}
+
+
+@app.get("/videos/{name}/faces")
+def video_faces(name: str, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    path = root / name
+    if not path.exists():
+        raise HTTPException(404, "video not found")
+    faces_file = index.faces_json_path(path)
+    if not faces_file.exists():
+        raise HTTPException(404, "faces not found")
+    return json.loads(faces_file.read_text())
 
 
 @app.get("/report")

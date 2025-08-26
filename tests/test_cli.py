@@ -3,6 +3,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+import numpy as np
+from fastapi.testclient import TestClient
+import api
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -81,16 +84,43 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     assert r_scenes.returncode == 0, r_scenes.stderr
     assert (tmp_path / "sample.mp4.scenes.json").exists()
 
+    # faces
+    r_faces = run_cli(["faces", str(tmp_path), "--output-format", "json"], env)
+    assert r_faces.returncode == 0, r_faces.stderr
+    assert (tmp_path / "sample.mp4.faces.json").exists()
+
     # report
     r_report = run_cli(["report", str(tmp_path), "--output-format", "json"], env)
     assert r_report.returncode == 0, r_report.stderr
     report_json = json.loads(r_report.stdout)
     # All artifacts should have count 1
-    for key in ["metadata","thumb","sprites","previews","subs","phash","heatmap","scenes"]:
+    for key in ["metadata","thumb","sprites","previews","subs","phash","heatmap","scenes","faces"]:
         assert report_json["counts"][key] == 1, f"{key} missing in report"
         assert report_json["coverage"][key] == 1.0
 
 
+def test_actor_build_and_match_stub(tmp_path: Path):
+    people = tmp_path / "people"
+    actor_dir = people / "A"
+    actor_dir.mkdir(parents=True)
+    (actor_dir / "a.jpg").write_bytes(b"00")
+    env = {"DEEPFACE_STUB": "1"}
+    emb = tmp_path / "gallery.npy"
+    lab = tmp_path / "labels.json"
+    r_build = run_cli(["actor-build", "--people-dir", str(people), "--embeddings", str(emb), "--labels", str(lab)], env)
+    assert r_build.returncode == 0, r_build.stderr
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"00")
+    r_match = run_cli(["actor-match", "--video", str(video), "--embeddings", str(emb), "--labels", str(lab)], env)
+    assert r_match.returncode == 0, r_match.stderr
+    faces_file = tmp_path / "v.mp4.faces.json"
+    assert faces_file.exists()
+    data = json.loads(faces_file.read_text())
+    assert data["detections"][0]["accepted_label"] == "A"
+    client = TestClient(api.app)
+    resp = client.get(f"/videos/{video.name}/faces", params={"directory": str(tmp_path)})
+    assert resp.status_code == 200
+    assert resp.json()["detections"][0]["accepted_label"] == "A"
 def test_queue_stub_mode(tmp_path: Path):
     (tmp_path / "a.mp4").write_bytes(b"00")
     (tmp_path / "b.mp4").write_bytes(b"0000")

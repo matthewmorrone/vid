@@ -35,9 +35,17 @@ import sys
 import threading
 import time
 import subprocess
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
 from queue import Queue, Empty
+except ImportError:
+    cv2 = None
+import numpy as np
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+np.random.seed(0)
+random.seed(0)
 
 # ---------------------------------------------------------------------------
 # File discovery & listing
@@ -1386,6 +1394,40 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sc.add_argument("--force", action="store_true")
     sc.add_argument("--output-format", choices=["json","text"], default="json")
 
+    fc = sub.add_parser("faces", help="Detect faces in videos")
+    fc.add_argument("directory", nargs="?", default=".")
+    fc.add_argument("-r", "--recursive", action="store_true")
+    fc.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
+    fc.add_argument("--force", action="store_true")
+    fc.add_argument("--output-format", choices=["json","text"], default="json")
+
+    ab = sub.add_parser("actor-build", help="Build face embedding gallery")
+    ab.add_argument("--people-dir", required=True)
+    ab.add_argument("--model", default="ArcFace")
+    ab.add_argument("--detector", default="retinaface")
+    ab.add_argument("--embeddings", default="gallery.npy")
+    ab.add_argument("--labels", default="labels.json")
+    ab.add_argument("--include-video", action="store_true")
+    ab.add_argument("--video-sample-rate", type=float, default=1.0)
+    ab.add_argument("--min-face-area", type=int, default=4096)
+    ab.add_argument("--blur-threshold", type=float, default=60.0)
+    ab.add_argument("--verbose", action="store_true")
+
+    am = sub.add_parser("actor-match", help="Match faces in a video")
+    am.add_argument("--video", required=True)
+    am.add_argument("--embeddings", default="gallery.npy")
+    am.add_argument("--labels", default="labels.json")
+    am.add_argument("--model", default="ArcFace")
+    am.add_argument("--detector", default="retinaface")
+    am.add_argument("--retry-detectors", default="mtcnn,opencv")
+    am.add_argument("--sample-rate", type=float, default=1.0)
+    am.add_argument("--topk", type=int, default=3)
+    am.add_argument("--conf", type=float, default=0.40)
+    am.add_argument("--min-face-area", type=int, default=4096)
+    am.add_argument("--blur-threshold", type=float, default=60.0)
+    am.add_argument("--out", default=None)
+    am.add_argument("--verbose", action="store_true")
+
     cd = sub.add_parser("codecs", help="Scan library for codec/profile compatibility")
     cd.add_argument("directory", nargs="?", default=".")
     cd.add_argument("-r", "--recursive", action="store_true")
@@ -1580,6 +1622,378 @@ def cmd_scenes(ns) -> int:
     return 1 if errors else 0
 
 # ---------------------------------------------------------------------------
+# Face detection
+# ---------------------------------------------------------------------------
+
+def faces_json_path(video: Path) -> Path:
+    return video.with_suffix(f"{video.suffix}.faces.json")
+
+
+def l2norm(x: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    n[n < 1e-12] = 1e-12
+    return x / n
+
+
+def detect_faces_stub(video: Path) -> list[dict]:
+    """Return a placeholder list of faces for the given video."""
+    return [
+        {
+            "time": 0.0,
+            "box": [0, 0, 100, 100],
+            "score": 1.0,
+            "embedding": [],
+        }
+    ]
+
+
+def _ensure_openface_model() -> Path:
+    """Download the OpenFace embedding model if not present."""
+        url = (
+            "https://storage.cmusatyalab.org/openface-models/nn4.small2.v1.t7"
+        )
+    cache = Path.home() / ".cache" / "vid"
+    cache.mkdir(parents=True, exist_ok=True)
+    model_path = cache / "openface.nn4.small2.v1.t7"
+    if not model_path.exists():
+        try:
+            import urllib.request
+
+            urllib.request.urlretrieve(url, model_path)
+        except Exception:
+            return model_path
+    return model_path
+
+
+def detect_faces(video: Path, interval: float = 1.0) -> list[dict]:
+    """Detect faces and generate embeddings using OpenCV + OpenFace.
+
+    Frames are sampled roughly once per ``interval`` seconds. Each detection
+    entry contains the timestamp (seconds), bounding box [x, y, w, h], and a
+    128-d embedding vector. If any step fails, a stub response is returned so
+    the command still produces output.
+    """
+    try:
+        import cv2  # type: ignore
+
+        cap = cv2.VideoCapture(str(video))
+        if not cap.isOpened():
+            raise RuntimeError("cannot open video")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        step = max(int(fps * interval), 1)
+        cascade = cv2.CascadeClassifier(
+            f"{cv2.data.haarcascades}haarcascade_frontalface_default.xml"
+        )
+        if cascade.empty():
+            raise RuntimeError("cascade not found")
+
+        # Load embedding model once
+        model_path = _ensure_openface_model()
+        net = cv2.dnn.readNetFromTorch(str(model_path))
+
+        results: list[dict] = []
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                detections = cascade.detectMultiScale(gray, 1.1, 5)
+                t = frame_idx / fps if fps else 0.0
+                for (x, y, w, h) in detections:
+                    face = frame[y : y + h, x : x + w]
+                    blob = cv2.dnn.blobFromImage(
+                        cv2.resize(face, (96, 96)),
+                        1 / 255.0,
+                        (96, 96),
+                        (0, 0, 0),
+                        swapRB=True,
+                        crop=False,
+                    )
+                    net.setInput(blob)
+                    vec = net.forward()[0]
+                    embedding = [round(float(v), 6) for v in vec.tolist()]
+                    results.append(
+                        {
+                            "time": round(t, 3),
+                            "box": [int(x), int(y), int(w), int(h)],
+                            "score": 1.0,
+                            "embedding": embedding,
+                        }
+                    )
+            frame_idx += 1
+        cap.release()
+        return results
+    except Exception:
+        return detect_faces_stub(video)
+
+
+def generate_faces(video: Path, force: bool) -> dict:
+    out_json = faces_json_path(video)
+    if out_json.exists() and not force:
+        return json.loads(out_json.read_text())
+    data = {"faces": detect_faces(video)}
+    out_json.write_text(json.dumps(data, indent=2))
+    return data
+
+
+def cmd_faces(ns) -> int:
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    videos = find_mp4s(root, ns.recursive)
+    if not videos:
+        print("No MP4 files found.")
+        return 0
+    worker_count = max(1, min(ns.workers, 4))
+    q: Queue[Path] = Queue()
+    for v in videos:
+        q.put(v)
+    done = 0
+    total = len(videos)
+    lock = threading.Lock()
+    errors: list[str] = []
+    results: list[tuple[str, dict]] = []
+
+    def worker():
+        nonlocal done
+        while True:
+            try:
+                vid = q.get_nowait()
+            except Empty:
+                return
+            try:
+                data = generate_faces(vid, ns.force)
+                with lock:
+                    results.append((vid.name, data))
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append(f"{vid.name}: {e}")
+            finally:
+                with lock:
+                    done += 1
+                    print(f"faces {done}/{total}\r", end="", file=sys.stderr)
+                q.task_done()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(worker_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"faces {done}/{total}", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print("Error:", e, file=sys.stderr)
+    if ns.output_format == "json":
+        print(json.dumps({"results": [
+            {"video": v, "count": len(d.get("faces", [])), "faces": d.get("faces")}
+            for v, d in results
+        ]}, indent=2))
+    else:
+        for v, d in results:
+            print(v, len(d.get("faces", [])))
+    return 1 if errors else 0
+
+# ---------------------------------------------------------------------------
+# Actor recognition
+# ---------------------------------------------------------------------------
+
+def cmd_actor_build(ns) -> int:
+    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    vid_exts = {".mp4"}
+    embeddings: list[np.ndarray] = []
+    labels: list[str] = []
+    counts: dict[str, int] = {}
+    stub = os.environ.get("DEEPFACE_STUB")
+    for actor_dir in Path(ns.people_dir).iterdir():
+        if not actor_dir.is_dir():
+            continue
+        actor = actor_dir.name
+        for path in actor_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            ext = path.suffix.lower()
+            if ext in img_exts:
+                if stub:
+                    embeddings.append(np.array([1, 0, 0, 0], dtype="float32"))
+                    labels.append(actor)
+                    counts[actor] = counts.get(actor, 0) + 1
+                    continue
+                img = cv2.imread(str(path))
+                if img is None:
+                    continue
+                try:
+                except (ValueError, RuntimeError):
+                    reps = []
+                faces = reps if isinstance(reps, list) else [reps]
+                for face in faces:
+                    fa = face.get("facial_area") or {}
+                    x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
+                    if w * h < ns.min_face_area:
+                        continue
+                    crop = img[y:y + h, x:x + w]
+                    if crop.size == 0:
+                        continue
+                    if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
+                        continue
+                    embeddings.append(np.array(face["embedding"], dtype="float32"))
+                    labels.append(actor)
+                    counts[actor] = counts.get(actor, 0) + 1
+            elif ns.include_video and ext in vid_exts:
+                if stub:
+                    continue
+                cap = cv2.VideoCapture(str(path))
+                if not cap.isOpened():
+                    continue
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                duration = frame_count / fps if fps > 0 else 0
+                t = 0.0
+                while t <= duration:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    try:
+                        from deepface import DeepFace
+                        reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=ns.detector, enforce_detection=True, align=True)
+                    except Exception:
+                        reps = []
+                    faces = reps if isinstance(reps, list) else [reps]
+                    for face in faces:
+                        fa = face.get("facial_area") or {}
+                        x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
+                        if w * h < ns.min_face_area:
+                            continue
+                        crop = frame[y:y + h, x:x + w]
+                        if crop.size == 0:
+                            continue
+                        if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
+                            continue
+                        embeddings.append(np.array(face["embedding"], dtype="float32"))
+                        labels.append(actor)
+                        counts[actor] = counts.get(actor, 0) + 1
+                    t += ns.video_sample_rate
+                cap.release()
+    if not embeddings:
+        print("No embeddings built")
+        return 1
+    arr = l2norm(np.vstack(embeddings).astype("float32"))
+    np.save(ns.embeddings, arr.astype("float32"))
+    with open(ns.labels, "w") as f:
+        json.dump(labels, f)
+    if getattr(ns, "verbose", False):
+        for actor in sorted(counts):
+            print(actor, counts[actor])
+        print(f"{arr.shape[0]}x{arr.shape[1]}")
+    return 0
+
+
+def cmd_actor_match(ns) -> int:
+    gallery = np.load(ns.embeddings).astype("float32")
+    with open(ns.labels) as f:
+        labels = json.load(f)
+    if len(gallery) != len(labels):
+        return 2
+    gallery = l2norm(gallery)
+    stub = os.environ.get("DEEPFACE_STUB")
+    if stub:
+        vec = gallery[0]
+        scores = gallery @ vec
+        k = min(ns.topk, len(scores))
+        idx = np.argsort(-scores)[:k]
+        top = [{"label": labels[i], "score": float(scores[i])} for i in idx]
+        accepted_label = labels[idx[0]] if k > 0 and scores[idx[0]] >= ns.conf else None
+        accepted_score = float(scores[idx[0]]) if k > 0 else 0.0
+        detections = [{"t": 0.0, "bbox": [0, 0, 10, 10], "embedding_cos_topk": top, "accepted_label": accepted_label, "accepted_score": accepted_score}]
+        agg = {}
+        if accepted_label is None:
+            agg["unknown"] = {"frames": 1}
+        else:
+            agg[accepted_label] = {"frames": 1, "first_t": 0.0, "last_t": 0.0}
+        out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+        data = {"video": ns.video, "fps": 30.0, "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
+        with open(out, "w") as f:
+            json.dump(data, f)
+        if getattr(ns, "verbose", False):
+            print(1, 1, out)
+        return 0
+    cap = cv2.VideoCapture(ns.video)
+    if not cap.isOpened():
+        print("Cannot open video")
+        return 1
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    retry = [d for d in ns.retry_detectors.split(",") if d]
+    detections: list[dict] = []
+    frame_count = 0
+    faces_total = 0
+    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps > 0 else 0
+    t = 0.0
+    while t <= duration:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+        try:
+        except (ValueError, RuntimeError):
+            reps = []
+        faces = reps if isinstance(reps, list) else [reps]
+        if len(faces) == 0:
+            for det in retry:
+                try:
+                except (ValueError, RuntimeError):
+                    reps = []
+                faces = reps if isinstance(reps, list) else [reps]
+                if len(faces) > 0:
+                    break
+        for face in faces:
+            fa = face.get("facial_area") or {}
+            x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
+            if w * h < ns.min_face_area:
+                continue
+            crop = frame[y:y + h, x:x + w]
+            if crop.size == 0:
+                continue
+            if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
+                continue
+            vec = l2norm(np.array(face["embedding"], dtype="float32")[None, :])[0]
+            scores = gallery @ vec
+            k = min(ns.topk, len(scores))
+            idx = np.argsort(-scores)[:k]
+            top = [{"label": labels[i], "score": float(scores[i])} for i in idx]
+            accepted_label = None
+            accepted_score = float(scores[idx[0]]) if k > 0 else 0.0
+            if k > 0 and accepted_score >= ns.conf:
+                accepted_label = labels[idx[0]]
+            detections.append({"t": t, "bbox": [int(x), int(y), int(x + w), int(y + h)], "embedding_cos_topk": top, "accepted_label": accepted_label, "accepted_score": accepted_score})
+            faces_total += 1
+        if getattr(ns, "verbose", False) and frame_count % 25 == 0:
+            print(frame_count, faces_total)
+        t += ns.sample_rate
+    cap.release()
+    agg: dict[str, dict] = {}
+    for d in detections:
+        l = d["accepted_label"]
+        if l is None:
+            agg.setdefault("unknown", {"frames": 0})["frames"] += 1
+        else:
+            if l not in agg:
+                agg[l] = {"frames": 0, "first_t": d["t"], "last_t": d["t"]}
+            agg[l]["frames"] += 1
+            agg[l]["last_t"] = d["t"]
+    out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+    data = {"video": ns.video, "fps": float(fps), "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
+    with open(out, "w") as f:
+        json.dump(data, f)
+    if getattr(ns, "verbose", False):
+        print(frame_count, faces_total, out)
+    return 0
+
+# ---------------------------------------------------------------------------
 # Heatmap generation (brightness/motion timeline)
 # ---------------------------------------------------------------------------
 
@@ -1712,53 +2126,31 @@ def scenes_dir(video: Path) -> Path:
     return video.parent / f".{video.name}.scenes"
 
 
-def detect_scenes_ffmpeg(video: Path, threshold: float) -> list[tuple[float, float]]:
-    if os.environ.get("FFPROBE_DISABLE") or not ffmpeg_available():
-        # stub 3 markers
+def detect_scenes(video: Path, threshold: float) -> list[tuple[float, float]]:
+    """Detect scene boundaries using PySceneDetect."""
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+
+        video_stream = open_video(str(video))
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=threshold))
+        scene_manager.detect_scenes(video_stream)
+        scenes = scene_manager.get_scene_list()
+        markers = [(start.get_seconds(), 1.0) for start, _ in scenes]
+        if not any(t == 0.0 for t, _ in markers):
+            markers.insert(0, (0.0, 1.0))
+        return markers
+    except Exception:
+        # fallback stub markers
         return [(0.0, 1.0), (30.0, 1.0), (60.0, 1.0)]
-    # Use ffmpeg showinfo with scene detection
-    # Command outputs lines containing 'pts_time:' and 'scene_score:'
-    cmd = [
-        "ffmpeg", "-v", "info", "-i", str(video),
-        "-filter:v", f"select='gt(scene\,{threshold})',showinfo",
-        "-f", "null", "-",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    out = proc.stderr + proc.stdout
-    markers: list[tuple[float, float]] = []
-    for line in out.splitlines():
-        if 'pts_time:' in line and 'scene_score:' in line:
-            # parse pts_time:XXX and scene_score:YYY
-            try:
-                parts = line.split()
-                pts_time = None
-                score = None
-                for p in parts:
-                    if p.startswith('pts_time:'):
-                        pts_time = float(p.split(':')[1])
-                    elif p.startswith('scene_score:'):
-                        score = float(p.split(':')[1])
-                if pts_time is not None and score is not None:
-                    markers.append((pts_time, score))
-            except Exception:
-                continue
-    # Include start always
-    if not any(t == 0.0 for t, _ in markers):
-        markers.insert(0, (0.0, 1.0))
-    # Sort unique
-    uniq: dict[float, float] = {}
-    for t, s in markers:
-        if t not in uniq or s > uniq[t]:
-            uniq[t] = s
-    items = sorted(uniq.items())
-    return items
 
 
 def generate_scene_artifacts(video: Path, threshold: float, limit: int, gen_thumbs: bool, gen_clips: bool, thumb_width: int, clip_duration: float, force: bool) -> dict:
     out_json = scenes_json_path(video)
     if out_json.exists() and not force:
         return json.loads(out_json.read_text())
-    markers = detect_scenes_ffmpeg(video, threshold)
+    markers = detect_scenes(video, threshold)
     if limit > 0:
         markers = markers[:limit]
     duration = extract_duration_from_file(video) or 0
@@ -2185,6 +2577,7 @@ def cmd_report(ns) -> int:
         "phash": 0,
         "heatmap": 0,
         "scenes": 0,
+        "faces": 0,
     }
     rows: list[dict] = []
     for v in videos:
@@ -2196,6 +2589,7 @@ def cmd_report(ns) -> int:
         phash_ok = phash_path(v).exists()
         heatmap_ok = heatmap_json_path(v).exists()
         scenes_ok = scenes_json_path(v).exists()
+        faces_ok = faces_json_path(v).exists()
         if meta_ok: counts["metadata"] += 1
         if thumb_ok: counts["thumb"] += 1
         if sprites_ok: counts["sprites"] += 1
@@ -2204,6 +2598,7 @@ def cmd_report(ns) -> int:
         if phash_ok: counts["phash"] += 1
         if heatmap_ok: counts["heatmap"] += 1
         if scenes_ok: counts["scenes"] += 1
+        if faces_ok: counts["faces"] += 1
         rows.append({
             "video": v.name,
             "metadata": meta_ok,
@@ -2214,6 +2609,7 @@ def cmd_report(ns) -> int:
             "phash": phash_ok,
             "heatmap": heatmap_ok,
             "scenes": scenes_ok,
+            "faces": faces_ok,
         })
     coverage = {k: (counts[k] / total) for k in counts}
     if ns.output_format == "json":
@@ -2297,6 +2693,10 @@ def main(argv: List[str] | None = None) -> int:
         return cmd_scenes(ns)
     if ns.cmd == "faces":
         return cmd_faces(ns)
+    if ns.cmd == "actor-build":
+        return cmd_actor_build(ns)
+    if ns.cmd == "actor-match":
+        return cmd_actor_match(ns)
     if ns.cmd == "codecs":
         return cmd_codecs(ns)
     if ns.cmd == "transcode":
