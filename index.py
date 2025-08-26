@@ -422,7 +422,7 @@ def cmd_thumb(ns) -> int:
 
 def sprite_sheet_paths(video: Path) -> tuple[Path, Path]:
     base = artifact_dir(video) / f"{video.stem}.sprites"
-    return Path(str(base) + ".jpg"), Path(str(base) + ".json")
+    return Path(f"{str(base)}.jpg"), Path(f"{str(base)}.json")
 
 
 def build_sprite_ffmpeg_cmd(video: Path, tmp_pattern: Path, interval: float, width: int, cols: int, rows: int, quality: int) -> list[str]:
