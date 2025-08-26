@@ -1675,7 +1675,7 @@ def detect_faces(video: Path, interval: float = 1.0) -> list[dict]:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         step = max(int(fps * interval), 1)
         cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            f"{cv2.data.haarcascades}haarcascade_frontalface_default.xml"
         )
         if cascade.empty():
             raise RuntimeError("cascade not found")
