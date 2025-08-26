@@ -907,9 +907,7 @@ def artifact_exists(video: Path, task: str) -> bool:
         return heatmap_json_path(video).exists()
     if task == "scenes":
         return scenes_json_path(video).exists()
-    if task == "faces":
-        return faces_json_path(video).exists()
-    return False
+    return faces_json_path(video).exists() if task == "faces" else False
 
 
 def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
