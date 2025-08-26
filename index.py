@@ -1979,7 +1979,7 @@ def cmd_actor_match(ns) -> int:
                 agg[l] = {"frames": 0, "first_t": d["t"], "last_t": d["t"]}
             agg[l]["frames"] += 1
             agg[l]["last_t"] = d["t"]
-    out = ns.out if ns.out else str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+    out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
     data = {"video": ns.video, "fps": float(fps), "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
     with open(out, "w") as f:
         json.dump(data, f)
