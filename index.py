@@ -1468,6 +1468,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     rpt.add_argument("-r", "--recursive", action="store_true")
     rpt.add_argument("--output-format", choices=["json","text"], default="text")
 
+    fc = sub.add_parser("faces", help="Detect and cluster faces across videos")
+    fc.add_argument("directory", nargs="?", default=".")
+    fc.add_argument("-r", "--recursive", action="store_true")
+    fc.add_argument("--frame-rate", type=float, default=1.0, help="Frames per second to sample")
+    fc.add_argument("--eps", type=float, default=0.5, help="DBSCAN eps parameter")
+    fc.add_argument("--min-samples", type=int, default=2, help="DBSCAN min samples")
+    fc.add_argument("--output", default=None, help="Write JSON result to file")
+
     return p.parse_args(argv)
 
 
@@ -2524,6 +2532,27 @@ def cmd_compare(ns) -> int:
         print(json.dumps(result, indent=2))
     else:
         print(result)
+    return 0
+
+
+def cmd_faces(ns) -> int:
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    videos = find_mp4s(root, ns.recursive)
+    from faces import cluster_faces
+    clusters = cluster_faces(
+        videos,
+        frame_rate=ns.frame_rate,
+        eps=ns.eps,
+        min_samples=ns.min_samples,
+    )
+    text = json.dumps(clusters, indent=2)
+    if ns.output:
+        Path(ns.output).write_text(text)
+    else:
+        print(text)
     return 0
 
 
