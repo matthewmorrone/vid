@@ -1342,7 +1342,7 @@ def cmd_phash(ns) -> int:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Video utility (list, metadata)")
-    p.add_argument("-d", "--dir", dest="dir", default=None, help="Root directory for commands")
+    p.add_argument("-d", "--dir", dest="root_dir", default=None, help="Root directory for commands")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
