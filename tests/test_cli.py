@@ -61,10 +61,10 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     assert r_prev.returncode == 0, r_prev.stderr
     assert (tmp_path / ".artifacts" / "sample.previews.json").exists()
 
-    # subs (default vtt)
+    # subs (SRT only)
     r_subs = run_cli(["subs", str(tmp_path)], env)
     assert r_subs.returncode == 0, r_subs.stderr
-    assert (tmp_path / ".artifacts" / "sample.vtt").exists()
+    assert (tmp_path / ".artifacts" / "sample.srt").exists()
 
     # phash
     r_phash = run_cli(["phash", str(tmp_path), "--frames", "1", "--output-format", "json"], env)

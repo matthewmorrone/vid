@@ -130,7 +130,7 @@ def artifact_dir(media_path: Path) -> Path:
 def subtitles_path_candidates(media_path: Path):
     d = artifact_dir(media_path)
     stem = media_path.stem
-    return [d / f"{stem}.srt", d / f"{stem}.vtt", d / f"{stem}.json"]
+    return [d / f"{stem}.srt"]
 
 def find_subtitles(media_path: Path):
     for p in subtitles_path_candidates(media_path):
@@ -425,7 +425,6 @@ def cmd_thumb(ns) -> int:
 def sprite_sheet_paths(video: Path) -> tuple[Path, Path]:
     base = artifact_dir(video) / f"{video.stem}.sprites"
     return Path(str(base) + ".jpg"), Path(str(base) + ".json")
-
 
 def build_sprite_ffmpeg_cmd(video: Path, tmp_pattern: Path, interval: float, width: int, cols: int, rows: int, quality: int) -> list[str]:
     # Use fps filter as 1/interval to sample frames. Scale width, preserve aspect, then tile.
@@ -723,34 +722,15 @@ def detect_backend(preference: str) -> str:
     return "whisper.cpp"  # assume external binary
 
 
-def format_segments(segments, fmt: str) -> str:
-    if fmt == "json":
-        return json.dumps([{
-            "start": s["start"],
-            "end": s["end"],
-            "text": s["text"].strip(),
-        } for s in segments], indent=2)
-    if fmt == "srt":
-        lines = []
-        for i, s in enumerate(segments, start=1):
-            def ts(t):
-                h = int(t // 3600)
-                m = int((t % 3600) // 60)
-                sec = t % 60
-                return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.', ',')
-            lines.append(str(i))
-            lines.append(f"{ts(s['start'])} --> {ts(s['end'])}")
-            lines.append(s['text'].strip())
-            lines.append("")
-        return "\n".join(lines).strip() + "\n"
-    # vtt
-    lines = ["WEBVTT", ""]
-    for s in segments:
+def format_segments(segments: List[Dict[str, Any]]) -> str:
+    lines = []
+    for i, s in enumerate(segments, start=1):
         def ts(t):
             h = int(t // 3600)
             m = int((t % 3600) // 60)
             sec = t % 60
-            return f"{h:02d}:{m:02d}:{sec:06.3f}"  # dot for VTT
+            return f"{h:02d}:{m:02d}:{sec:06.3f}".replace('.', ',')
+        lines.append(str(i))
         lines.append(f"{ts(s['start'])} --> {ts(s['end'])}")
         lines.append(s['text'].strip())
         lines.append("")
@@ -868,16 +848,15 @@ def cmd_subs(ns) -> int:
             except Empty:
                 return
             try:
-                suffix_map = {"vtt": ".vtt", "srt": ".srt", "json": ".json"}
                 out_dir = out_dir_base or artifact_dir(vid)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_file = out_dir / (vid.stem + suffix_map[ns.format])
+                out_file = out_dir / f"{vid.stem}.srt"
                 if out_file.exists() and not ns.force:
                     pass
                 else:
                     print(f"subs {vid.name}", file=sys.stderr)
                     segments = run_whisper_backend(vid, backend, ns.model, ns.language, ns.translate, ns.whisper_cpp_bin, ns.whisper_cpp_model, getattr(ns, "compute_type", None))
-                    text = format_segments(segments, ns.format)
+                    text = format_segments(segments)
                     out_file.write_text(text)
             except Exception as e:  # noqa: BLE001
                 with lock:
@@ -925,10 +904,7 @@ def artifact_exists(video: Path, task: str) -> bool:
     if task == "previews":
         return preview_index_path(video).exists() or preview_output_dir(video).exists()
     if task == "subs":
-        for suf in (".vtt", ".srt", ".json"):
-            if (artifact_dir(video) / f"{video.stem}{suf}").exists():
-                return True
-        return False
+        return (artifact_dir(video) / f"{video.stem}.srt").exists()
     if task == "phash":
         return phash_path(video).exists()
     if task == "heatmap":
@@ -996,10 +972,9 @@ def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
         elif task == "subs":
             backend = detect_backend(ns.subs_backend)
             segments = run_whisper_backend(video, backend, ns.subs_model, ns.subs_language, ns.subs_translate, None, None, getattr(ns, "compute_type", None))
-            text = format_segments(segments, ns.subs_format)
-            suffix = {"vtt": ".vtt", "srt": ".srt", "json": ".json"}[ns.subs_format]
+            text = format_segments(segments)
             artifact_dir(video).mkdir(exist_ok=True)
-            (artifact_dir(video) / f"{video.stem}{suffix}").write_text(text)
+            (artifact_dir(video) / f"{video.stem}.srt").write_text(text)
         elif task == "phash":
             # Use 5 evenly spaced frames by default in batch mode for more robust whole-video signature (algo defaults)
             compute_phash_video(video, frame_time_spec="middle", frames=5, force=ns.force, algo="ahash", combine="xor")
@@ -1046,9 +1021,9 @@ def cmd_batch(ns) -> int:
         "thumb": max(1, ns.max_thumb),
         "sprites": max(1, ns.max_sprites),
         "previews": max(1, ns.max_previews),
-    "subs": max(1, ns.max_subs),
-    "phash": max(1, ns.max_phash),
-    "scenes": max(1, ns.max_scenes),
+        "subs": max(1, ns.max_subs),
+        "phash": max(1, ns.max_phash),
+        "scenes": max(1, ns.max_scenes),
     }
 
     # Build job list in stage order: stage-by-stage to respect dependencies (e.g., sprites prefer metadata but not strictly required).
@@ -1371,7 +1346,7 @@ def cmd_phash(ns) -> int:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Video utility (list, metadata)")
-    p.add_argument("-d", "--dir", dest="dir", default=None, help="Root directory for commands")
+    p.add_argument("-d", "--dir", dest="root_dir", default=None, help="Root directory for commands")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
@@ -1426,7 +1401,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sb.add_argument("--backend", choices=["auto", "whisper", "faster-whisper", "whisper.cpp"], default="auto", help="Backend selection (default auto)")
     sb.add_argument("--language", default=None, help="Source language (auto detect if omitted)")
     sb.add_argument("--translate", action="store_true", help="Translate to English")
-    sb.add_argument("--format", choices=["vtt", "srt", "json"], default="vtt", help="Subtitle output format (default vtt)")
     sb.add_argument("--workers", type=int, default=1, help="Parallel videos (cap 2)")
     sb.add_argument("--force", action="store_true", help="Regenerate even if subtitle file exists")
     sb.add_argument("--output-dir", default=None, help="Directory to place subtitle files (defaults alongside videos)")
@@ -1454,7 +1428,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     bt.add_argument("--sprites-rows", type=int, default=10)
     bt.add_argument("--subs-model", default="small")
     bt.add_argument("--subs-backend", default="auto")
-    bt.add_argument("--subs-format", default="vtt")
     bt.add_argument("--subs-language", default=None)
     bt.add_argument("--subs-translate", action="store_true")
     bt.add_argument("--force", action="store_true", help="Force regenerate all artifacts")
@@ -2770,7 +2743,7 @@ def cmd_finish(ns) -> int:
         sprites_rows=10,
         subs_model="small",
         subs_backend="auto",
-        subs_format="vtt",
+        subs_format="srt",
         subs_language=None,
         subs_translate=False,
         force=False,
@@ -2798,16 +2771,17 @@ def cmd_meta(ns) -> int:
     print(f"Metadata done for {result['total']} file(s)")
     return 0
 
-
-
+def resolve_directory(ns):
+    """Consolidate logic for setting ns.directory from ns.dir."""
+    if getattr(ns, "dir", None):
+        # If ns.directory is missing or set to "." or None, use ns.dir
+        if not hasattr(ns, "directory") or ns.directory == "." or ns.directory is None:
+            ns.directory = ns.dir
+    return ns
 
 def main(argv: List[str] | None = None) -> int:
     ns = parse_args(argv or sys.argv[1:])
-    if getattr(ns, "dir", None) and hasattr(ns, "directory"):
-        if ns.directory == "." or ns.directory is None:
-            ns.directory = ns.dir
-    elif getattr(ns, "dir", None) and not hasattr(ns, "directory"):
-        ns.directory = ns.dir
+    ns = resolve_directory(ns)
     if ns.cmd == "list":
         return cmd_list(ns)
     if ns.cmd == "report":
