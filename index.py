@@ -124,7 +124,7 @@ ARTIFACTS_DIR = ".artifacts"
 
 def artifact_dir(media_path: Path) -> Path:
     d = media_path.parent / ARTIFACTS_DIR
-    d.mkdir(exist_ok=True)
+    d.mkdir(exist_ok=True, parents=True)
     return d
 
 def subtitles_path_candidates(media_path: Path):
@@ -158,13 +158,15 @@ def rename_with_artifacts(src: Path, dst: Path) -> None:
 def find_videos(root: Path, recursive: bool = False, exts: set[str] | None = None) -> List[Path]:
     exts = exts or {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
     iterator = root.rglob("*") if recursive else root.iterdir()
-    vids = [
-        p
-        for p in iterator
-        if p.is_file()
-        and p.suffix.lower() in exts
-        and ARTIFACTS_DIR not in p.parts
-    ]
+    vids = []
+    for p in iterator:
+        # Exclude files that are immediate children of ARTIFACTS_DIR
+        if (
+            p.is_file()
+            and p.suffix.lower() in exts
+            and p.parent != ARTIFACTS_DIR
+        ):
+            vids.append(p)
     vids.sort()
     return vids
 
@@ -422,8 +424,7 @@ def cmd_thumb(ns) -> int:
 
 def sprite_sheet_paths(video: Path) -> tuple[Path, Path]:
     base = artifact_dir(video) / f"{video.stem}.sprites"
-    return Path(f"{str(base)}.jpg"), Path(f"{str(base)}.json")
-
+    return Path(str(base) + ".jpg"), Path(str(base) + ".json")
 
 def build_sprite_ffmpeg_cmd(video: Path, tmp_pattern: Path, interval: float, width: int, cols: int, rows: int, quality: int) -> list[str]:
     # Use fps filter as 1/interval to sample frames. Scale width, preserve aspect, then tile.
@@ -910,7 +911,9 @@ def artifact_exists(video: Path, task: str) -> bool:
         return heatmap_json_path(video).exists()
     if task == "scenes":
         return scenes_json_path(video).exists()
-    return faces_json_path(video).exists() if task == "faces" else False
+    if task == "faces":
+        return faces_json_path(video).exists()
+    return False
 
 
 def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
@@ -1018,9 +1021,9 @@ def cmd_batch(ns) -> int:
         "thumb": max(1, ns.max_thumb),
         "sprites": max(1, ns.max_sprites),
         "previews": max(1, ns.max_previews),
-    "subs": max(1, ns.max_subs),
-    "phash": max(1, ns.max_phash),
-    "scenes": max(1, ns.max_scenes),
+        "subs": max(1, ns.max_subs),
+        "phash": max(1, ns.max_phash),
+        "scenes": max(1, ns.max_scenes),
     }
 
     # Build job list in stage order: stage-by-stage to respect dependencies (e.g., sprites prefer metadata but not strictly required).
@@ -2740,6 +2743,7 @@ def cmd_finish(ns) -> int:
         sprites_rows=10,
         subs_model="small",
         subs_backend="auto",
+        subs_format="srt",
         subs_language=None,
         subs_translate=False,
         force=False,
@@ -2766,9 +2770,6 @@ def cmd_meta(ns) -> int:
             print("  " + e, file=sys.stderr)
     print(f"Metadata done for {result['total']} file(s)")
     return 0
-
-
-
 
 def resolve_directory(ns):
     """Consolidate logic for setting ns.directory from ns.dir."""
