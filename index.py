@@ -1906,7 +1906,7 @@ def cmd_actor_match(ns) -> int:
             agg["unknown"] = {"frames": 1}
         else:
             agg[accepted_label] = {"frames": 1, "first_t": 0.0, "last_t": 0.0}
-        out = ns.out if ns.out else str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
+        out = ns.out or str(Path(ns.video).with_suffix(Path(ns.video).suffix + ".faces.json"))
         data = {"video": ns.video, "fps": 30.0, "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
         with open(out, "w") as f:
             json.dump(data, f)
