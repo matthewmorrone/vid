@@ -1,4 +1,8 @@
 fastapi
 uvicorn
 pydantic
+opencv-python
+scenedetect
+deepface
+numpy
 httpx
