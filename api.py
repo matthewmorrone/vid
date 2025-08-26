@@ -132,7 +132,6 @@ class JobExecutor(threading.Thread):
             ns.backend = params.get("backend", "auto")
             ns.language = params.get("language")
             ns.translate = params.get("translate", False)
-            ns.format = params.get("format", "vtt")
             ns.output_dir = None
             ns.whisper_cpp_bin = None
             ns.whisper_cpp_model = None
@@ -225,10 +224,11 @@ def generate_report(root: Path, recursive: bool) -> dict:
     counts = {k: 0 for k in ("metadata","thumb","sprites","previews","subs","phash","heatmap","scenes","faces")}
     for v in videos:
         if index.metadata_path(v).exists(): counts["metadata"] += 1
-        if (v.with_suffix(v.suffix + ".jpg")).exists(): counts["thumb"] += 1
-        if (v.with_suffix(v.suffix + ".sprites.jpg")).exists(): counts["sprites"] += 1
+        if index.thumb_path(v).exists(): counts["thumb"] += 1
+        s, j = index.sprite_sheet_paths(v)
+        if s.exists() and j.exists(): counts["sprites"] += 1
         if index.preview_index_path(v).exists(): counts["previews"] += 1
-        if any((v.parent / (v.name + ext)).exists() for ext in (".vtt", ".srt", ".json")): counts["subs"] += 1
+        if index.find_subtitles(v) is not None: counts["subs"] += 1
         if index.phash_path(v).exists(): counts["phash"] += 1
         try:
             if index.heatmap_json_path(v).exists(): counts["heatmap"] += 1
@@ -280,13 +280,14 @@ def video_artifacts(name: str, directory: str = Query(".")):
     path = root / name
     if not path.exists():
         raise HTTPException(404, "video not found")
+    s, j = index.sprite_sheet_paths(path)
     return {
         "video": name,
         "metadata": index.metadata_path(path).exists(),
-        "thumb": (path.with_suffix(path.suffix + ".jpg")).exists(),
-        "sprites": (path.with_suffix(path.suffix + ".sprites.jpg")).exists(),
+        "thumb": index.thumb_path(path).exists(),
+        "sprites": s.exists() and j.exists(),
         "previews": index.preview_index_path(path).exists(),
-        "subs": any((path.parent / (path.name + ext)).exists() for ext in (".vtt", ".srt", ".json")),
+        "subs": index.find_subtitles(path) is not None,
         "phash": index.phash_path(path).exists(),
         "heatmap": hasattr(index, 'heatmap_json_path') and index.heatmap_json_path(path).exists(),
         "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),

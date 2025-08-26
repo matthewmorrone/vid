@@ -28,7 +28,7 @@ python index.py queue [dir] [-r] [--force] [--workers N]
 python index.py thumb [dir] [-r] [--force] [--workers N] [--time middle|10|25%] [--quality 2]
 python index.py sprites [dir] [-r] [--interval 10] [--width 320] [--cols 10] [--rows 10] [--quality 4] [--max-frames 0] [--force]
 python index.py previews [dir] [-r] [--segments 9] [--duration 1.0] [--width 320] [--format mp4|webm] [--crf 30] [--bitrate 300k] [--workers 2] [--force] [--no-index]
-python index.py subs [dir] [-r] [--model small] [--backend auto|whisper|faster-whisper|whisper.cpp] [--language xx] [--translate] [--format vtt|srt|json] [--workers 1] [--force]
+python index.py subs [dir] [-r] [--model small] [--backend auto|whisper|faster-whisper|whisper.cpp] [--language xx] [--translate] [--workers 1] [--force]
 python index.py batch [dir] [-r] [--tasks meta,thumb] [--max-meta 3] [--max-thumb 4] [--max-sprites 2] [--max-previews 2] [--max-subs 1] [--force]
 python index.py phash [dir] [-r] [--time middle|60|25%] [--frames 5] [--algo ahash|dct] [--combine xor|majority|avg] [--workers 2] [--force] [--output-format json|text]
 python index.py heatmap [dir] [-r] [--interval 5.0] [--mode brightness|motion|both] [--png] [--workers 2] [--force] [--output-format json|text]
@@ -113,7 +113,7 @@ python index.py thumb ~/videos -r --workers 2 --time 25% --quality 4
 python index.py sprites ~/videos -r --interval 8 --cols 12 --rows 8 --width 256
 python index.py previews ~/videos -r --segments 9 --duration 1.0 --width 320
 FFPROBE_DISABLE=1 python index.py meta ./samples
-python index.py subs ./videos -r --model small --backend auto --format vtt
+python index.py subs ./videos -r --model small --backend auto
 ```
 
 ## Exit Codes

@@ -61,4 +61,4 @@ def test_job_meta_and_report(tmp_path, monkeypatch):
         assert report.status_code == 200
         data = report.json()
         assert data["counts"]["metadata"] == 1
-    assert (tmp_path / "v.mp4.ffprobe.json").exists()
+    assert (tmp_path / ".artifacts" / "v.ffprobe.json").exists()
