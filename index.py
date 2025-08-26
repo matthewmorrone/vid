@@ -158,10 +158,13 @@ def rename_with_artifacts(src: Path, dst: Path) -> None:
 def find_videos(root: Path, recursive: bool = False, exts: set[str] | None = None) -> List[Path]:
     exts = exts or {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
     iterator = root.rglob("*") if recursive else root.iterdir()
-    vids = []
-    for p in iterator:
-        if p.is_file() and p.suffix.lower() in exts and ARTIFACTS_DIR not in p.parts:
-            vids.append(p)
+    vids = [
+        p
+        for p in iterator
+        if p.is_file()
+        and p.suffix.lower() in exts
+        and ARTIFACTS_DIR not in p.parts
+    ]
     vids.sort()
     return vids
 
