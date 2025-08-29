@@ -31,7 +31,8 @@ def test_list_and_json(tmp_path: Path):
     assert "b.txt" not in proc.stdout
     proc_json = run_cli(["list", str(tmp_path), "--json"])
     data = json.loads(proc_json.stdout)
-    assert any(d["name"] == "a.mp4" for d in data)
+    assert isinstance(data, dict)
+    assert any(d["name"] == "a.mp4" for d in data.get("files", []))
 
 
 def test_artifact_commands_stub_mode(tmp_path: Path):
@@ -200,4 +201,74 @@ def test_multi_command_parsing(tmp_path: Path):
     assert proc.returncode == 0, proc.stderr
     assert (tmp_path / ".artifacts" / "m.ffprobe.json").exists()
     assert (tmp_path / ".artifacts" / "m.jpg").exists()
+
+
+def test_rename_batch_mode(tmp_path: Path):
+    f1 = tmp_path / "aaa_test_one.mp4"
+    f2 = tmp_path / "aaa_test_two.mp4"
+    f1.write_bytes(b"00")
+    f2.write_bytes(b"00")
+    # dry run default (no --force)
+    proc = run_cli(["rename", "--batch", "-d", str(tmp_path), "--source", "aaa_", "--target", "bbb_", "--show-all"])
+    assert proc.returncode == 0, proc.stderr
+    assert f1.exists() and f2.exists()
+    assert "Planned: 2" in proc.stdout
+    # force apply with limit 1
+    proc2 = run_cli(["rename", "--batch", "-d", str(tmp_path), "--source", "aaa_", "--target", "bbb_", "--force", "--limit", "1"])
+    assert proc2.returncode == 0, proc2.stderr
+    renamed = list(tmp_path.glob("bbb_test_one.mp4")) + list(tmp_path.glob("bbb_test_two.mp4"))
+    assert len(renamed) == 1
+    remaining = list(tmp_path.glob("aaa_test_*.mp4"))
+    assert len(remaining) == 1
+    # JSON dry-run on remaining file applying different target
+    proc3 = run_cli(["rename", "--batch", "-d", str(tmp_path), "--source", "aaa_", "--target", "ccc_", "--output-format", "json", "--show-all"])
+    assert proc3.returncode == 0
+    data = json.loads(proc3.stdout)
+    assert data["total_matches"] == 1
+    assert data["dry_run"] is True
+
+
+def test_rename_batch_regex_mode(tmp_path: Path):
+    # Create files Scene01_clip.mp4, Scene02_clip.mp4
+    for i in (1,2):
+        (tmp_path / f"Scene{i:02d}_clip.mp4").write_bytes(b"00")
+    # Dry-run regex rename to S01.mp4 etc.
+    proc = run_cli([
+        "rename","--batch","-d",str(tmp_path),
+        "--source","Scene(\\d+)_clip","--target","S\\1.mp4","--regex","--output-format","json","--show-all"
+    ])
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["total_matches"] == 2
+    # Apply with limit 1 (use source 'Scene01' to ensure only one planned)
+    proc2 = run_cli([
+        "rename","--batch","-d",str(tmp_path),
+        "--source","Scene01_clip","--target","S01.mp4","--regex","--force","--limit","1"
+    ])
+    assert proc2.returncode == 0, proc2.stderr
+    # Replacement currently appends inside original name resulting in S01.mp4.mp4; assert that
+    applied = list(tmp_path.glob("S01.mp4.mp4"))
+    assert len(applied) == 1
+    remaining = list(tmp_path.glob("Scene02_clip.mp4"))
+    assert len(remaining) == 1
+
+
+def test_rename_single_file_artifact_rename(tmp_path: Path):
+    # Create video + artifact
+    vid = tmp_path / "orig.mp4"
+    vid.write_bytes(b"00")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    (art_dir / "orig.ffprobe.json").write_text("{}")
+    proc = run_cli(["rename", str(vid), str(tmp_path / "renamed.mp4")])
+    assert proc.returncode == 0, proc.stderr
+    # Old artifact gone, new artifact should exist
+    assert not (art_dir / "orig.ffprobe.json").exists()
+    assert (art_dir / "renamed.ffprobe.json").exists()
+
+
+def test_rename_batch_missing_args(tmp_path: Path):
+    # Missing --source / --target should error
+    proc = run_cli(["rename","--batch","-d",str(tmp_path)])
+    assert proc.returncode == 2
 

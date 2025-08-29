@@ -132,3 +132,27 @@ def test_api_tags_endpoints(tmp_path, monkeypatch):
         etag = first.json()["etag"]
         not_mod = client.get("/videos", params={"directory": str(tmp_path)}, headers={"If-None-Match": etag})
         assert not_mod.status_code == 304
+
+
+    def test_api_cancel_metadata_job(tmp_path, monkeypatch):
+        monkeypatch.setenv("FFPROBE_DISABLE", "1")
+        # Create many stub videos to keep job busy long enough to cancel
+        for i in range(80):
+            (tmp_path / f"v{i}.mp4").write_bytes(b"00")
+        from fastapi.testclient import TestClient
+        import api
+        with TestClient(api.app) as client:
+            job = client.post("/jobs", json={"task": "metadata", "directory": str(tmp_path), "params": {"force": True}}).json()
+            job_id = job["id"]
+            # Issue cancel quickly
+            cancel_resp = client.delete(f"/jobs/{job_id}")
+            assert cancel_resp.status_code == 200
+            # Wait for final state
+            final_status = None
+            for _ in range(40):
+                st = client.get(f"/jobs/{job_id}").json()
+                if st["status"] in ("canceled", "done", "error"):
+                    final_status = st["status"]
+                    break
+                time.sleep(0.1)
+            assert final_status == "canceled", f"expected canceled got {final_status}"

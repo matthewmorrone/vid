@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
-"""Unified video utility script.
+"""Unified video utility CLI & helpers.
 
-Functions:
-  list   - List .mp4 files with optional recursion / JSON / sizes.
-  metadata   - Generate ffprobe metadata JSON files for .mp4s.
-           (Skips existing unless --force.)
-  
+High-level capabilities:
+    - Library inspection (list, report, orphans)
+    - Artifact generation (metadata, thumbs, sprites, previews, subtitles, phash,
+        heatmaps, scenes, face embeddings, people listing, codecs scan, transcode)
+    - Batch / multi-command chaining & rename utilities
+    - Tag management (user + performer) with JSON artifacts
+    - Progress + cooperative cancellation (API integration) & metadata summary cache
 
-The 'queue' command is an ephemeral in-memory scheduler to avoid CPU thrash on
-low-power devices. It discovers files (like metadata) then processes them with a
-thread pool (default 1 worker).
+Environment shortcuts:
+    FFPROBE_DISABLE=1   Produce stub metadata / fast test mode
 
-Metadata Output:
-  For each video foo.mp4 we write foo.mp4.ffprobe.json
-
-ffprobe Invocation:
-  ffprobe -v quiet -print_format json -show_format -show_streams <file>
-
-Testing / Offline Mode:
-  Set FFPROBE_DISABLE=1 to skip invoking ffprobe and produce a stub JSON.
-
-Exit Codes:
-  0 success
-  2 directory not found
-  3 ffprobe missing or failed (non-fatal per-file; command exits 0 unless a
-    hard error before processing begins)
-
+Exit codes: 0 success; 2 input error
 """
 from __future__ import annotations
 import argparse
@@ -39,7 +26,6 @@ import subprocess
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
-from types import SimpleNamespace
 from queue import Queue, Empty
 try:  # Optional dependency; many commands work without OpenCV
     import cv2  # type: ignore
@@ -58,71 +44,27 @@ np.random.seed(0)
 random.seed(0)
 
 # ---------------------------------------------------------------------------
+# Cooperative cancellation (used by API job executor)
+# ---------------------------------------------------------------------------
+class CanceledError(RuntimeError):
+    """Raised internally to signal cooperative cancellation of a command."""
+
+_cancel_event: threading.local = threading.local()
+
+def set_cancel_event(ev: threading.Event | None):  # called by API layer
+    _cancel_event.token = ev  # type: ignore[attr-defined]
+
+def cancel_requested() -> bool:
+    ev = getattr(_cancel_event, 'token', None)
+    return bool(ev and ev.is_set())
+
+# ---------------------------------------------------------------------------
 # File discovery & listing
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Merged helpers (from faces.py & find_misnamed_assets.py)
 # ---------------------------------------------------------------------------
-
-def cluster_faces(
-    videos: Iterable[Path],
-    frame_rate: float = 1.0,
-    eps: float = 0.5,
-    min_samples: int = 2,
-):
-    """Detect faces in videos and cluster them by similarity.
-
-    Returns dict[label] -> list occurrences. If heavy dependencies are missing,
-    raises a RuntimeError so caller can decide how to degrade.
-    """
-    try:
-        import cv2  # type: ignore
-        import face_recognition  # type: ignore
-        from sklearn.cluster import DBSCAN  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("face clustering requires cv2, face_recognition and scikit-learn") from exc
-    embeddings: list[np.ndarray] = []
-    occurrences: list[dict] = []
-    for video in videos:
-        cap = cv2.VideoCapture(str(video))
-        if not cap.isOpened():
-            cap.release()
-            continue
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        step = max(int(round(fps / frame_rate)), 1)
-        frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % step == 0:
-                rgb = frame[:, :, ::-1]
-                boxes = face_recognition.face_locations(rgb)
-                if boxes:
-                    encs = face_recognition.face_encodings(rgb, boxes)
-                    ts = frame_idx / fps
-                    for (top, right, bottom, left), enc in zip(boxes, encs):
-                        embeddings.append(enc)
-                        occurrences.append({
-                            "video": Path(video).name,
-                            "timestamp": ts,
-                            "bbox": {"top": int(top), "right": int(right), "bottom": int(bottom), "left": int(left)},
-                        })
-            frame_idx += 1
-        cap.release()
-    if not embeddings:
-        return {}
-    data = np.vstack(embeddings).astype("float32")
-    norms = np.linalg.norm(data, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    normalized = data / norms
-    labels = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean").fit_predict(normalized)
-    clusters: dict[int, list[dict]] = {}
-    for lab, occ in zip(labels, occurrences):
-        clusters.setdefault(int(lab), []).append(occ)
-    return clusters
-
 
 def extract_distinct_face_signatures(
     video: Path,
@@ -137,9 +79,8 @@ def extract_distinct_face_signatures(
 ) -> list[dict]:
     """Return representative face signature tracks for a single video.
 
-    Simplified lightweight implementation: detects faces on sampled frames,
-    obtains embeddings (if heavy deps present) and clusters them with DBSCAN.
-    In test/stub mode (FFPROBE_DISABLE) or missing deps returns empty list.
+    Simplified: sample frames, detect faces + embeddings (if deps present), cluster with DBSCAN.
+    In stub mode or when deps missing returns empty list gracefully.
     """
     if os.environ.get("FFPROBE_DISABLE"):
         return []
@@ -405,6 +346,8 @@ def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int 
     # Pre-scan to count existing artifacts to provide summary line
     existing = 0
     for v in videos:
+        if cancel_requested():
+            raise CanceledError("metadata canceled")
         if (not force) and metadata_path(v).exists():
             existing += 1
         q.put(v)
@@ -460,6 +403,15 @@ def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int 
     # Only show a rolling progress line if work remains
     if remaining > 0:
         while any(t.is_alive() for t in threads):
+            if cancel_requested():
+                # Drain queue so workers exit quickly
+                while True:
+                    try:
+                        q.get_nowait()
+                        q.task_done()
+                    except Empty:
+                        break
+                raise CanceledError("metadata canceled")
             with lock:
                 covered = existing + generated if not force else generated
                 if covered > total:
@@ -554,7 +506,7 @@ def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -
     return True
 
 
-def cmd_thumbs(ns) -> int:
+def cmd_thumbs(ns: argparse.Namespace) -> int:
     """Generate a single thumbnail per video (time chosen by --time) with skip-aware progress."""
     root = Path(ns.directory).expanduser().resolve()
     # Accept direct single video file path
@@ -580,7 +532,19 @@ def cmd_thumbs(ns) -> int:
     pct_existing = (existing / total * 100.0) if total else 0.0
     if remaining == 0:
         print(f"thumbs: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force to regenerate).", file=sys.stderr)
-        print(f"Thumbs generated for 0 file(s)")
+        if getattr(ns, "output_format", "text") == "json":
+            print(json.dumps({
+                "command": "thumbs",
+                "directory": str(root),
+                "total": total,
+                "existing": existing,
+                "generated": 0,
+                "skipped": existing,
+                "errors": [],
+                "force": bool(ns.force),
+            }, indent=2))
+        else:
+            print(f"Thumbs generated for 0 file(s)")
         return 0
     print(f"thumbs: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     errors: list[str] = []
@@ -617,6 +581,14 @@ def cmd_thumbs(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            # drain queue
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("thumbs canceled")
         with lock:
             covered = existing + generated if not ns.force else generated
             if covered > total:
@@ -634,7 +606,19 @@ def cmd_thumbs(ns) -> int:
         print("Errors (some thumbs missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Thumbs generated for {generated} file(s)")
+    if getattr(ns, "output_format", "text") == "json":
+        print(json.dumps({
+            "command": "thumbs",
+            "directory": str(root),
+            "total": total,
+            "existing": existing,
+            "generated": generated,
+            "skipped": existing if not ns.force else 0,
+            "errors": errors,
+            "force": bool(ns.force),
+        }, indent=2))
+    else:
+        print(f"Thumbs generated for {generated} file(s)")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -749,7 +733,7 @@ def generate_sprite_sheet(video: Path, interval: float, width: int, cols: int, r
     return True, None
 
 
-def cmd_sprites(ns) -> int:
+def cmd_sprites(ns: argparse.Namespace) -> int:
     """Create sprite sheet + JSON index (grid of frames) for each video (skip-aware)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -778,13 +762,27 @@ def cmd_sprites(ns) -> int:
     pct_existing = (existing / total * 100.0) if total else 0.0
     if remaining == 0:
         print(f"sprites: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
-        print("Sprite sheets generated for 0 file(s)")
+        if getattr(ns, "output_format", "text") == "json":
+            print(json.dumps({
+                "command": "sprites",
+                "directory": str(root),
+                "total": total,
+                "existing": existing,
+                "generated": 0,
+                "skipped": existing,
+                "errors": [],
+                "force": bool(ns.force),
+            }, indent=2))
+        else:
+            print("Sprite sheets generated for 0 file(s)")
         return 0
     print(f"sprites: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     generated = 0
     processed = 0
     errors: list[str] = []
     for v in to_process:
+        if cancel_requested():
+            raise CanceledError("sprites canceled")
         ok, err = generate_sprite_sheet(v, interval, ns.width, cols, rows, ns.quality, True, ns.max_frames)
         processed += 1
         if not ok and err:
@@ -801,7 +799,19 @@ def cmd_sprites(ns) -> int:
         print("Errors (some sprite sheets missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Sprite sheets generated for {generated} file(s)")
+    if getattr(ns, "output_format", "text") == "json":
+        print(json.dumps({
+            "command": "sprites",
+            "directory": str(root),
+            "total": total,
+            "existing": existing,
+            "generated": generated,
+            "skipped": existing if not ns.force else 0,
+            "errors": errors,
+            "force": bool(ns.force),
+        }, indent=2))
+    else:
+        print(f"Sprite sheets generated for {generated} file(s)")
     return 0 if not errors else 1
 
 # ---------------------------------------------------------------------------
@@ -857,7 +867,7 @@ def build_preview_cmd(video: Path, start: float, duration: float, width: int, ou
     ]
 
 
-def cmd_previews(ns) -> int:
+def cmd_previews(ns: argparse.Namespace) -> int:
     """Generate short hover preview clips (segmented) and an index JSON (skip-aware)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -899,7 +909,19 @@ def cmd_previews(ns) -> int:
     pct_existing = (existing / total * 100.0) if total else 0.0
     if remaining == 0:
         print(f"previews: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
-        print("Hover previews generated for 0 file(s)")
+        if getattr(ns, "output_format", "text") == "json":
+            print(json.dumps({
+                "command": "previews",
+                "directory": str(root),
+                "total": total,
+                "existing": existing,
+                "generated": 0,
+                "skipped": existing,
+                "errors": [],
+                "force": bool(ns.force),
+            }, indent=2))
+        else:
+            print("Hover previews generated for 0 file(s)")
         return 0
     print(f"previews: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     processed = 0
@@ -972,6 +994,14 @@ def cmd_previews(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            # drain queue
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("previews canceled")
         with lock:
             covered = existing + generated if not ns.force else generated
             if covered > total: covered = total
@@ -987,8 +1017,7 @@ def cmd_previews(ns) -> int:
         print("Errors (some previews missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Hover previews generated for {generated} file(s)")
-    if ns.output_format == "json":
+    if getattr(ns, "output_format", "text") == "json":
         results = []
         for v in videos:
             idx = preview_index_path(v)
@@ -1001,7 +1030,18 @@ def cmd_previews(ns) -> int:
                 except Exception:
                     has_index = False
             results.append({"video": v.name, "has_index": has_index, "segments": seg_count})
-        print(json.dumps({"results": results}, indent=2))
+        print(json.dumps({
+            "command": "previews",
+            "directory": str(root),
+            "total": total,
+            "existing": existing,
+            "generated": generated,
+            "results": results,
+            "errors": errors,
+            "force": bool(ns.force),
+        }, indent=2))
+    else:
+        print(f"Hover previews generated for {generated} file(s)")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -1123,7 +1163,7 @@ def run_whisper_backend(video: Path, backend: str, model_name: str, language: st
     raise RuntimeError(f"Unknown backend {backend}")
 
 
-def cmd_subtitles(ns) -> int:
+def cmd_subtitles(ns: argparse.Namespace) -> int:
     """Generate SRT subtitles only (skip-aware; counts existing)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -1193,6 +1233,13 @@ def cmd_subtitles(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("subtitles canceled")
         with lock:
             covered = existing + generated if not ns.force else generated
             if covered > total: covered = total
@@ -1329,7 +1376,7 @@ def meta_single(video: Path, force: bool) -> bool:
     return True
 
 
-def cmd_batch(ns) -> int:
+def cmd_batch(ns: argparse.Namespace) -> int:
     """Run a batch of artifact generators (metadata, thumbs, sprites, previews, subtitles) together."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -1745,7 +1792,7 @@ def find_phash_duplicates(root: Path, recursive: bool = False, threshold: float 
     }
 
 
-def cmd_phash(ns) -> int:
+def cmd_phash(ns: argparse.Namespace) -> int:
     """Compute perceptual hash (single or multi-frame combined) for duplicates detection."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -1806,6 +1853,13 @@ def cmd_phash(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("phash canceled")
         with lock:
             covered = existing + generated if not ns.force else generated
             if covered > total: covered = total
@@ -1829,7 +1883,7 @@ def cmd_phash(ns) -> int:
     return 0 if not errors else 1
 
 
-def cmd_phash_dupes(ns) -> int:
+def cmd_phash_dupes(ns: argparse.Namespace) -> int:
     """Report likely duplicate video pairs using existing pHash artifacts.
 
     Requires that phash artifacts already exist (run 'phash' first). Outputs
@@ -1863,26 +1917,61 @@ def cmd_phash_dupes(ns) -> int:
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     # Preprocess to allow directory-first style: index.py /path command ...
+    # Also collect global flags placed after subcommand (user convenience)
+    # Extract -q/--quiet, -v repetitions, --log FILE, --log-format VALUE and move before parsing.
+    collected: list[str] = []
+    residual: list[str] = []
+    skip_next = False
+    for i, tok in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ('-q','--quiet'):
+            collected.append(tok)
+            continue
+        if tok == '-v':
+            collected.append(tok)
+            continue
+        if tok == '--log' and i+1 < len(argv):
+            collected.extend([tok, argv[i+1]])
+            skip_next = True
+            continue
+        if tok == '--log-format' and i+1 < len(argv):
+            collected.extend([tok, argv[i+1]])
+            skip_next = True
+            continue
+        residual.append(tok)
+    if collected:
+        argv = collected + residual
     if argv:
         try:
             first = Path(argv[0])
             # Known command names set (keep in sync with subparsers)
             # Keep this synchronized with the set in main(); only current, supported commands (no legacy aliases)
-            command_names = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish"}
+            command_names = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish","tags"}
             if first.exists() and len(argv) > 1 and argv[1] in command_names:
                 # Swap to command-first
                 argv = [argv[1], *argv[2:], str(first)]
             # Also support form: command path (original default) so no change needed.
         except Exception:  # noqa: BLE001
             pass
-    p = argparse.ArgumentParser(description="Video utility (list, metadata)")
+    p = argparse.ArgumentParser(description="Video utility (list, metadata, thumbs, sprites, previews, subtitles, phash, dupes, heatmaps, scenes, embed, listing, rename, codecs, transcode, compare, batch, report, orphans, finish, tags, doctor, sample)")
     p.add_argument("-d", "--dir", dest="root_dir", default=None, help="Root directory for commands (alternate to positional directory)")
+    p.add_argument("--list-commands", action="store_true", help="List available command names and exit (works standalone)")
+    # Global verbosity / logging flags
+    p.add_argument("-q", "--quiet", action="store_true", help="Suppress progress / info output (errors still reported)")
+    p.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (repeat for more detail)")
+    p.add_argument("--log", dest="log_file", help="Append structured log events to file (JSON lines when --log-format jsonl)")
+    p.add_argument("--log-format", choices=["jsonl","text"], default="jsonl", help="Log file format (default jsonl)")
+    p.add_argument("--config", help="Path to videorc.json configuration file (overrides built-in defaults)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
     lp.add_argument("directory", nargs="?", default=".")
     lp.add_argument("-r", "--recursive", action="store_true")
-    lp.add_argument("--json", action="store_true")
+    # Deprecated legacy flag: still accepted; prefer --output-format json
+    lp.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    lp.add_argument("--output-format", choices=["text","json"], default="text", help="Output format (default text). Use json for structured output.")
     lp.add_argument("--show-size", action="store_true")
     lp.add_argument("--sort", choices=["name", "size"], default="name")
 
@@ -1890,14 +1979,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     mp.add_argument("directory", nargs="?", default=".")
     mp.add_argument("-r", "--recursive", action="store_true")
     mp.add_argument("--force", action="store_true", help="Regenerate even if output exists")
-    mp.add_argument("--workers", type=int, default=1)
+    mp.add_argument("--workers", type=int, default=None)
 
     tp = sub.add_parser("thumbs", help="Generate cover thumbnails (JPEG)")
     tp.add_argument("directory", nargs="?", default=".")
     tp.add_argument("-r", "--recursive", action="store_true")
     tp.add_argument("--time", dest="time_spec", default="middle", help="When to capture frame: seconds (e.g. 10), percentage (e.g. 25%), or 'middle' (default)")
     tp.add_argument("--force", action="store_true", help="Regenerate even if thumbnail exists")
-    tp.add_argument("--workers", type=int, default=1, help="Worker threads (cap 4)")
+    tp.add_argument("--workers", type=int, default=None, help="Worker threads (cap 4)")
     tp.add_argument("--quality", type=int, default=2, help="JPEG quality scale (ffmpeg -q:v, 2=high, 31=low)")
 
     sp = sub.add_parser("sprites", help="Generate sprite sheet + JSON for hover preview")
@@ -1920,7 +2009,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     hp.add_argument("--format", choices=["mp4", "webm"], default="webm", help="Output container/codec (default webm)")
     hp.add_argument("--crf", type=int, default=30, help="Quality factor (x264/webm CRF, lower=better)")
     hp.add_argument("--bitrate", type=str, default="300k", help="Target bitrate for webm (if using webm)")
-    hp.add_argument("--workers", type=int, default=2, help="Worker threads (cap 4)")
+    hp.add_argument("--workers", type=int, default=None, help="Worker threads (cap 4)")
     hp.add_argument("--force", action="store_true", help="Regenerate existing previews")
     hp.add_argument("--no-index", action="store_true", help="Skip writing index JSON")
     hp.add_argument("--output-format", choices=["json","text"], default="text")
@@ -1932,7 +2021,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sb.add_argument("--backend", choices=["auto", "whisper", "faster-whisper", "whisper.cpp"], default="auto", help="Backend selection (default auto)")
     sb.add_argument("--language", default=None, help="Source language (auto detect if omitted)")
     sb.add_argument("--translate", action="store_true", help="Translate to English")
-    sb.add_argument("--workers", type=int, default=1, help="Parallel videos (cap 2)")
+    sb.add_argument("--workers", type=int, default=None, help="Parallel videos (cap 2)")
     sb.add_argument("--force", action="store_true", help="Regenerate even if subtitle file exists")
     sb.add_argument("--output-dir", default=None, help="Directory to place subtitle files (defaults alongside videos)")
     sb.add_argument("--whisper-cpp-bin", default=None, help="Path to whisper.cpp binary (if backend whisper.cpp)")
@@ -1969,7 +2058,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     ph.add_argument("--time", default="middle", help="Timestamp 'middle', seconds (e.g. 60), or percentage (e.g. 25%)")
     ph.add_argument("--frames", type=int, default=5, help="Number of evenly spaced frames to combine (XOR) (default 5 for broader coverage; use 1 for speed)")
     ph.add_argument("--force", action="store_true")
-    ph.add_argument("--workers", type=int, default=2, help="Worker threads (cap 4)")
+    ph.add_argument("--workers", type=int, default=None, help="Worker threads (cap 4)")
     ph.add_argument("--output-format", choices=["json","text"], default="json")
     ph.add_argument("--algo", choices=["ahash","dct"], default="ahash", help="Frame hash algorithm: ahash (32x32 avg) or dct (classic 8x8 pHash) (default ahash)")
     ph.add_argument("--combine", choices=["xor","majority","avg"], default="xor", help="Combine multi-frame hashes: xor (fast), majority/avg (bit vote) (default xor)")
@@ -2014,7 +2103,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     hm.add_argument("--interval", type=float, default=5.0, help="Seconds between samples (default 5.0)")
     hm.add_argument("--mode", choices=["brightness","motion","both"], default="both", help="Metrics to compute (default both)")
     hm.add_argument("--png", action="store_true", help="Also write a small PNG stripe visualization")
-    hm.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
+    hm.add_argument("--workers", type=int, default=None, help="Parallel videos (cap 4)")
     hm.add_argument("--force", action="store_true")
     hm.add_argument("--output-format", choices=["json","text"], default="json")
     hm.add_argument("--verbose", action="store_true", help="Print per-video diagnostic details (durations, sample counts, skips, errors)")
@@ -2035,7 +2124,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sc.add_argument("--clips", action="store_true", help="Generate short clip per scene start")
     sc.add_argument("--clip-duration", type=float, default=2.0, help="Seconds per scene clip (default 2.0)")
     sc.add_argument("--thumbs-width", type=int, default=320, help="Thumbnail width (default 320)")
-    sc.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
+    sc.add_argument("--workers", type=int, default=None, help="Parallel videos (cap 4)")
     sc.add_argument("--force", action="store_true")
     sc.add_argument("--output-format", choices=["json","text"], default="json")
 
@@ -2048,7 +2137,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     cd.add_argument("--target-v", default="h264", help="Target video codec (default h264)")
     cd.add_argument("--target-a", default="aac", help="Target audio codec (or copy) (default aac)")
     cd.add_argument("--allowed-profiles", default="high,main,constrained baseline", help="Comma list acceptable H.264 profiles")
-    cd.add_argument("--workers", type=int, default=4)
+    cd.add_argument("--workers", type=int, default=None)
     cd.add_argument("--log", default=None, help="Write incompatible entries to this log file")
     cd.add_argument("--output-format", choices=["json","text"], default="text")
     cd.add_argument("--all", action="store_true", help="Show all entries, not just incompatible ones")
@@ -2066,7 +2155,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     tc.add_argument("--preset", default="medium")
     tc.add_argument("--hardware", choices=["none","videotoolbox"], default="none")
     tc.add_argument("--drop-subtitles", action="store_true", help="Exclude subtitle streams")
-    tc.add_argument("--workers", type=int, default=1)
+    tc.add_argument("--workers", type=int, default=None)
     tc.add_argument("--force", action="store_true", help="Force transcode even if compatible")
     tc.add_argument("--dry-run", action="store_true")
     tc.add_argument("--progress", action="store_true", help="Show real-time progress for each file")
@@ -2086,7 +2175,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     fn = sub.add_parser("finish", help="Generate missing artifacts based on report")
     fn.add_argument("directory", nargs="?", default=".")
     fn.add_argument("-r", "--recursive", action="store_true")
-    fn.add_argument("--workers", type=int, default=2)
+    fn.add_argument("--workers", type=int, default=None)
 
     tg = sub.add_parser("tags", help="Apply or list tags (performers + user tags) for videos")
     tg.add_argument("directory", nargs="?", default=".", help="Directory or single video .mp4 path")
@@ -2104,14 +2193,115 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
     # Deprecated face-related commands removed in favor of embed / listing.
 
-    rn = sub.add_parser("rename", help="Rename a video and associated artifacts")
-    rn.add_argument("src")
-    rn.add_argument("dst")
+    rn = sub.add_parser("rename", help="Single-file rename or batch mode with --batch")
+    # Single-file mode (default): positional src/dst
+    rn.add_argument("src", nargs="?", help="Source file (single-file mode)")
+    rn.add_argument("dst", nargs="?", help="Destination file (single-file mode)")
+    # Batch mode flags
+    rn.add_argument("--batch", action="store_true", help="Enable batch rename mode")
+    rn.add_argument("-d", "--directory", default=".", help="Root directory for batch mode (default .)")
+    rn.add_argument("--source", help="Source string or regex pattern (batch mode)")
+    rn.add_argument("--target", help="Replacement string (batch mode)")
+    rn.add_argument("--regex", action="store_true", help="Interpret --source as a regular expression")
+    rn.add_argument("--ext", default=".mp4", help="Extension filter in batch mode (default .mp4, '*' = all)")
+    rn.add_argument("-r", "--recursive", action="store_true", help="Recurse into subdirectories (batch mode)")
+    rn.add_argument("--force", action="store_true", help="Apply changes (omit for dry-run in batch mode)")
+    rn.add_argument("--limit", type=int, default=0, help="Max renames to perform (0 = unlimited, batch mode)")
+    rn.add_argument("--output-format", choices=["text","json"], default="text", help="Output format (batch report or single-file result)")
+    rn.add_argument("--show-all", action="store_true", help="Show all planned renames (batch mode)")
 
-    return p.parse_args(argv)
+    # Doctor: environment / capability diagnostic
+    doc = sub.add_parser("doctor", help="Environment diagnostics (versions, tool availability)")
+    doc.add_argument("--output-format", choices=["text","json"], default="text")
+
+    # Sample: generate tiny synthetic demo video set
+    samp = sub.add_parser("sample", help="Generate a small synthetic sample video set")
+    samp.add_argument("directory", nargs="?", default=".")
+    samp.add_argument("--count", type=int, default=3, help="Number of videos to create (default 3)")
+    samp.add_argument("--duration", type=float, default=1.0, help="Duration seconds each (default 1.0)")
+    samp.add_argument("--width", type=int, default=320)
+    samp.add_argument("--height", type=int, default=240)
+    samp.add_argument("--output-format", choices=["text","json"], default="text")
+
+    ns = p.parse_args(argv)
+    # Load configuration file (precedence: --config path > VIDEORC env > videorc.json in cwd/root_dir)
+    config_paths: list[Path] = []
+    if getattr(ns, "config", None):
+        config_paths.append(Path(ns.config).expanduser())
+    env_cfg = os.environ.get("VIDEORC")
+    if env_cfg:
+        config_paths.append(Path(env_cfg).expanduser())
+    # Determine search base (explicit directory if provided on subcommand or root_dir flag)
+    base_dir = None
+    for attr in ("directory","root_dir"):
+        if hasattr(ns, attr) and getattr(ns, attr) is not None:
+            val = getattr(ns, attr)
+            if isinstance(val, str):
+                base_dir = Path(val).expanduser()
+                break
+    if base_dir is None:
+        base_dir = Path.cwd()
+    config_paths.append(base_dir / "videorc.json")
+    loaded_config: dict[str, Any] = {}
+    for cp in config_paths:
+        if cp.is_file():
+            try:
+                loaded_config = json.loads(cp.read_text())
+                break
+            except Exception:
+                continue
+    # Built-in worker defaults (used if arg omitted and not provided via config)
+    builtin_worker_defaults = {
+        'metadata': 1,
+        'thumbs': 1,
+        'previews': 2,
+        'subtitles': 1,
+        'phash': 2,
+        'heatmaps': 2,
+        'scenes': 2,
+        'codecs': 4,
+        'transcode': 1,
+        'finish': 2,
+    }
+    workers_cfg = {}
+    thresholds_cfg = {}
+    if loaded_config:
+        workers_cfg = loaded_config.get("workers", {}) if isinstance(loaded_config.get("workers"), dict) else {}
+        thresholds_cfg = loaded_config.get("thresholds", {}) if isinstance(loaded_config.get("thresholds"), dict) else {}
+    # Apply worker override for single-worker style commands
+    cmd = getattr(ns, 'cmd', None)
+    if cmd in builtin_worker_defaults and hasattr(ns, 'workers'):
+        if getattr(ns, 'workers') is None:
+            # Order: config workers.cmd -> builtin default
+            setattr(ns, 'workers', workers_cfg.get(cmd, builtin_worker_defaults[cmd]))
+    # Batch command concurrency overrides
+    if cmd == 'batch' and workers_cfg:
+        batch_map = {
+            'metadata': 'max_metadata',
+            'thumbs': 'max_thumbs',
+            'sprites': 'max_sprites',
+            'previews': 'max_previews',
+            'subtitles': 'max_subtitles',
+            'phash': 'max_phash',
+            'scenes': 'max_scenes'
+        }
+        for key, flag in batch_map.items():
+            if key in workers_cfg:
+                # Only override if user left default (we rely on known parser defaults) OR if value is None
+                # Parser defaults (above) not None; we check if user explicitly supplied by comparing to defaults
+                parser_defaults = {'max_metadata':3,'max_thumbs':4,'max_sprites':2,'max_previews':2,'max_subtitles':1,'max_phash':4,'max_scenes':1}
+                current = getattr(ns, flag)
+                if current == parser_defaults[flag]:
+                    setattr(ns, flag, workers_cfg[key])
+    # Threshold overrides
+    if cmd == 'scenes' and hasattr(ns, 'threshold') and ns.threshold == 0.4 and 'scene' in thresholds_cfg:
+        ns.threshold = thresholds_cfg['scene']
+    if cmd == 'dupes' and hasattr(ns, 'threshold') and ns.threshold == 0.90 and 'phash_similarity' in thresholds_cfg:
+        ns.threshold = thresholds_cfg['phash_similarity']
+    return ns
 
 
-def cmd_list(ns) -> int:
+def cmd_list(ns: argparse.Namespace) -> int:
     """List .mp4 files with optional size sorting / JSON output."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2123,8 +2313,17 @@ def cmd_list(ns) -> int:
         records.sort(key=lambda r: r["name"].lower())
     else:
         records.sort(key=lambda r: r["size_bytes"], reverse=True)
-    if ns.json:
-        json.dump(records, sys.stdout, indent=2)
+    output_format = getattr(ns, "output_format", None) or ("json" if getattr(ns, "json", False) else "text")
+    # Back-compat: if legacy --json flag used but output_format left at default text, override
+    if getattr(ns, "json", False) and output_format == "text":
+        output_format = "json"
+    if output_format == "json":
+        json.dump({
+            "command": "list",
+            "directory": str(root),
+            "count": len(records),
+            "files": records,
+        }, sys.stdout, indent=2)
         print()
     else:
         if not records:
@@ -2137,7 +2336,7 @@ def cmd_list(ns) -> int:
     return 0
 
 
-def cmd_heatmaps(ns) -> int:
+def cmd_heatmaps(ns: argparse.Namespace) -> int:
     """Compute brightness & motion heatmaps timeline (JSON, optional PNG)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2220,6 +2419,13 @@ def cmd_heatmaps(ns) -> int:
         t.start()
     # Periodic scan progress (mirrors thumbs/phash style)
     while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("heatmaps canceled")
         with lock:
             covered = existing + generated if not ns.force else generated
             if covered > total: covered = total
@@ -2246,17 +2452,25 @@ def cmd_heatmaps(ns) -> int:
         for e in errors:
             print("Error:", e, file=sys.stderr)
     if ns.output_format == "json":
-        print(json.dumps({"results": [
-            {"video": v, "heatmaps": {k: val for k, val in d.items() if k != "samples"}, "samples": d.get("samples")}
-            for v, d in results
-        ]}, indent=2))
+        print(json.dumps({
+            "command": "heatmaps",
+            "directory": str(root),
+            "total": total,
+            "existing": existing,
+            "generated": generated,
+            "errors": errors,
+            "results": [
+                {"video": v, "heatmaps": {k: val for k, val in d.items() if k != "samples"}, "samples": d.get("samples")}
+                for v, d in results
+            ]
+        }, indent=2))
     else:
         for v, d in results:
             print(v, len(d.get("samples", [])))
     return 1 if errors else 0
 
 
-def cmd_orphans(ns) -> int:
+def cmd_orphans(ns: argparse.Namespace) -> int:
     """List (and optionally delete) orphan artifact files.
 
     An artifact is considered orphaned if it's inside a .artifacts directory whose parent
@@ -2312,7 +2526,8 @@ def cmd_orphans(ns) -> int:
                     pass
     if ns.output_format == "json":
         print(json.dumps({
-            "root": str(root),
+            "command": "orphans",
+            "directory": str(root),
             "scanned_artifact_files": scanned,
             "orphans_found": len(orphans),
             "deleted": deleted,
@@ -2330,7 +2545,7 @@ def cmd_orphans(ns) -> int:
     return 0
 
 
-def cmd_scenes(ns) -> int:
+def cmd_scenes(ns: argparse.Namespace) -> int:
     """Detect scene boundaries (FFmpeg select filter) and optionally thumbs/clips."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2389,6 +2604,15 @@ def cmd_scenes(ns) -> int:
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(worker_count)]
     for t in threads:
         t.start()
+    while any(t.is_alive() for t in threads):
+        if cancel_requested():
+            while True:
+                try:
+                    q.get_nowait(); q.task_done()
+                except Empty:
+                    break
+            raise CanceledError("scenes canceled")
+        time.sleep(0.25)
     for t in threads:
         t.join()
     with lock:
@@ -2399,10 +2623,18 @@ def cmd_scenes(ns) -> int:
         for e in errors:
             print("Error:", e, file=sys.stderr)
     if ns.output_format == "json":
-        print(json.dumps({"results": [
-            {"video": v, "count": len(d.get("markers", [])), "threshold": d.get("threshold"), "markers": d.get("markers")}
-            for v, d in results
-        ]}, indent=2))
+        print(json.dumps({
+            "command": "scenes",
+            "directory": str(root),
+            "total": total,
+            "existing": existing,
+            "generated": generated,
+            "errors": errors,
+            "results": [
+                {"video": v, "count": len(d.get("markers", [])), "threshold": d.get("threshold"), "markers": d.get("markers")}
+                for v, d in results
+            ]
+        }, indent=2))
     else:
         for v, d in results:
             print(v, len(d.get("markers", [])))
@@ -2817,7 +3049,7 @@ def build_transcode_cmd(src: Path, dst: Path, target_v: str, target_a: str, crf:
     return cmd
 
 
-def cmd_codecs(ns) -> int:
+def cmd_codecs(ns: argparse.Namespace) -> int:
     """Scan videos for codec/profile compatibility vs desired target codecs."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2869,7 +3101,14 @@ def cmd_codecs(ns) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"Warning: failed to write log: {e}", file=sys.stderr)
     if ns.output_format == "json":
-        print(json.dumps({"results": results, "target_v": ns.target_v, "target_a": ns.target_a}, indent=2))
+        print(json.dumps({
+            "command": "codecs",
+            "directory": str(root),
+            "target_v": ns.target_v,
+            "target_a": ns.target_a,
+            "total": total,
+            "results": results
+        }, indent=2))
     else:
         for r in results:
             if r["compatible"] and not ns.all:
@@ -2880,7 +3119,7 @@ def cmd_codecs(ns) -> int:
     return 0
 
 
-def cmd_transcode(ns) -> int:
+def cmd_transcode(ns: argparse.Namespace) -> int:
     """Transcode incompatible videos toward target codecs (supports dry-run & progress)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2977,7 +3216,7 @@ def cmd_transcode(ns) -> int:
     for t in threads: t.start()
     for t in threads: t.join()
     print(f"transcode {done}/{len(vids)}", file=sys.stderr)
-    summary = {"actions": actions, "errors": errors, "total": len(vids), "dry_run": dry, "target_v": ns.target_v, "target_a": ns.target_a}
+    summary = {"command": "transcode", "directory": str(root), "actions": actions, "errors": errors, "total": len(vids), "dry_run": dry, "target_v": ns.target_v, "target_a": ns.target_a}
     if ns.output_format == "json":
         print(json.dumps(summary, indent=2))
     else:
@@ -2989,7 +3228,7 @@ def cmd_transcode(ns) -> int:
     return 1 if errors else 0
 
 
-def cmd_compare(ns) -> int:
+def cmd_compare(ns: argparse.Namespace) -> int:
     """Compare two videos computing SSIM & PSNR quality metrics."""
     src = Path(ns.original).expanduser().resolve()
     dst = Path(ns.other).expanduser().resolve()
@@ -3056,7 +3295,7 @@ def cmd_compare(ns) -> int:
         "acceptable" if (psnr or 0) >= 30 else
         "poor"
     ) if psnr is not None else None
-    result = {"original": str(src), "other": str(dst), "ssim": ssim, "ssim_quality": interp_ssim, "psnr": psnr, "psnr_quality": interp_psnr}
+    result = {"command": "compare", "original": str(src), "other": str(dst), "ssim": ssim, "ssim_quality": interp_ssim, "psnr": psnr, "psnr_quality": interp_psnr}
     if ns.output_format == "json":
         print(json.dumps(result, indent=2))
     else:
@@ -3066,7 +3305,7 @@ def cmd_compare(ns) -> int:
 
 
 
-def cmd_faces_embed(ns) -> int:
+def cmd_faces_embed(ns: argparse.Namespace) -> int:
     """Extract distinct face signatures per video (tracking + clustering + optional thumbnails)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -3078,6 +3317,8 @@ def cmd_faces_embed(ns) -> int:
         return 0
     results: list[dict] = []
     for v in videos:
+        if cancel_requested():
+            raise CanceledError("embed canceled")
         try:
             sigs = extract_distinct_face_signatures(
                 v,
@@ -3116,7 +3357,7 @@ def cmd_faces_embed(ns) -> int:
         except Exception as e:  # noqa: BLE001
             results.append({"video": v.name, "error": str(e)})
     if ns.output_format == "json":
-        print(json.dumps({"results": results}, indent=2))
+        print(json.dumps({"command": "embed", "directory": str(root), "results": results}, indent=2))
     else:
         for r in results:
             if "error" in r:
@@ -3126,7 +3367,7 @@ def cmd_faces_embed(ns) -> int:
     return 0
 
 
-def cmd_faces_index(ns):
+def cmd_faces_index(ns: argparse.Namespace) -> int:
     """Build a global face index across videos (deduplicated people list).
 
     Returns the index dict (people, videos, etc.) instead of exit code for easier reuse by API.
@@ -3142,6 +3383,8 @@ def cmd_faces_index(ns):
         cluster_eps=ns.cluster_eps,
         cluster_min_samples=ns.cluster_min_samples,
     )
+    if cancel_requested():
+        raise CanceledError("listing canceled")
     # Optional supervised labeling via gallery directory
     if getattr(ns, "gallery", None):
         gal_root = Path(ns.gallery).expanduser().resolve()
@@ -3223,11 +3466,13 @@ def cmd_faces_index(ns):
     else:
         print(f"people={len(index.get('people', []))} videos={index.get('videos')}")
         for person in index.get("people", [])[:20]:
+            if cancel_requested():
+                raise CanceledError("listing canceled")
             print(person["id"], len(person.get("occurrences", [])))
-    return index
+    return 0
 
 
-def cmd_report(ns) -> int:
+def cmd_report(ns: argparse.Namespace) -> int:
     """Summarize artifact coverage (counts & percentages) across videos."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -3318,8 +3563,23 @@ def cmd_report(ns) -> int:
     return 0
 
 
-def cmd_rename(ns) -> int:
-    rename_with_artifacts(Path(ns.src), Path(ns.dst))
+def cmd_rename(ns: argparse.Namespace) -> int:
+    # Batch mode
+    if getattr(ns, "batch", False):
+        return _cmd_rename_batch(ns)
+    # Single-file mode
+    if not ns.src or not ns.dst:
+        print("Error: src and dst required for single-file rename (omit --batch)", file=sys.stderr)
+        return 2
+    src = Path(ns.src)
+    dst = Path(ns.dst)
+    rename_with_artifacts(src, dst)
+    if getattr(ns, "output_format", "text") == "json":
+        print(json.dumps({
+            "renamed": True,
+            "src": str(src.resolve()),
+            "dst": str(dst.resolve()),
+        }, indent=2))
     return 0
 
 
@@ -3339,6 +3599,8 @@ def generate_report(root: Path, recursive: bool) -> dict:
         "faces": 0,
     }
     for v in videos:
+        if cancel_requested():
+            raise CanceledError("report canceled")
         if metadata_path(v).exists(): counts["metadata"] += 1
         if thumbs_path(v).exists(): counts["thumbs"] += 1
         s, j = sprite_sheet_paths(v)
@@ -3351,7 +3613,120 @@ def generate_report(root: Path, recursive: bool) -> dict:
         if faces_json_path(v).exists(): counts["faces"] += 1
     return {"total": total, "counts": counts}
 
-def cmd_finish(ns) -> int:
+# ---------------------------------------------------------------------------
+# Metadata summary cache (duration, codecs) to avoid parsing full ffprobe JSON repeatedly
+# ---------------------------------------------------------------------------
+
+def metadata_summary_cache_path(root: Path) -> Path:
+    return root / ARTIFACTS_DIR / ".metadata.summary.json"
+
+
+def build_metadata_summary(root: Path, recursive: bool) -> dict:
+    """Scan metadata sidecars and extract lightweight summaries.
+
+    Returns mapping of relative video path -> summary.
+    """
+    entries: dict[str, dict[str, Any]] = {}
+    mp4s = find_mp4s(root, recursive)
+    root_str = str(root)
+    latest_meta_mtime = 0.0
+    for v in mp4s:
+        mpath = metadata_path(v)
+        if not mpath.exists():
+            continue
+        try:
+            stat_m = mpath.stat()
+            latest_meta_mtime = max(latest_meta_mtime, stat_m.st_mtime)
+            data = json.loads(mpath.read_text())
+            duration = None
+            vcodec = None
+            acodec = None
+            if isinstance(data, dict):
+                fmt = data.get("format")
+                if isinstance(fmt, dict):
+                    d = fmt.get("duration")
+                    try:
+                        if d is not None:
+                            duration = float(d)
+                    except Exception:
+                        pass
+                streams = data.get("streams")
+                if isinstance(streams, list):
+                    for s in streams:
+                        if not isinstance(s, dict):
+                            continue
+                        codec_type = s.get("codec_type")
+                        codec_name = s.get("codec_name")
+                        if codec_type == "video" and vcodec is None:
+                            vcodec = codec_name
+                        elif codec_type == "audio" and acodec is None:
+                            acodec = codec_name
+            rel = str(v.relative_to(root)) if str(v).startswith(root_str) else str(v)
+            entries[rel] = {
+                "duration": duration,
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "size": v.stat().st_size,
+                "video_mtime": v.stat().st_mtime,
+                "metadata_mtime": stat_m.st_mtime,
+            }
+        except Exception:
+            continue
+    return {
+        "version": 1,
+        "generated_at": time.time(),
+        "root": str(root),
+        "recursive": bool(recursive),
+        "entries": entries,
+    }
+
+
+def load_metadata_summary(root: Path, recursive: bool, max_age: float = 300.0) -> dict[str, dict[str, Any]]:
+    """Load (and if needed rebuild) metadata summary cache for root.
+
+    Rebuild triggers:
+      - cache missing or unreadable
+      - recursive flag mismatch
+      - cache older than any metadata sidecar mtime
+      - cache older than max_age seconds
+    """
+    cache_path = metadata_summary_cache_path(root)
+    try:
+        cache = json.loads(cache_path.read_text()) if cache_path.exists() else None
+    except Exception:
+        cache = None
+    rebuild = False
+    if not cache:
+        rebuild = True
+    else:
+        if cache.get("recursive") != bool(recursive):
+            rebuild = True
+        elif cache.get("root") != str(root):
+            rebuild = True
+        else:
+            generated_at = float(cache.get("generated_at") or 0)
+            if (time.time() - generated_at) > max_age:
+                rebuild = True
+            else:
+                # Quick probe: if any metadata sidecar newer than generated_at -> rebuild
+                for v in find_mp4s(root, recursive):
+                    mpath = metadata_path(v)
+                    try:
+                        if mpath.exists() and mpath.stat().st_mtime > generated_at:
+                            rebuild = True
+                            break
+                    except Exception:
+                        continue
+    if rebuild:
+        cache = build_metadata_summary(root, recursive)
+        try:
+            cache_path.parent.mkdir(exist_ok=True)
+            cache_path.write_text(json.dumps(cache, indent=2))
+        except Exception:
+            pass
+    return cache.get("entries", {}) if isinstance(cache, dict) else {}
+
+def cmd_finish(ns: argparse.Namespace) -> int:
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -3372,9 +3747,18 @@ def cmd_finish(ns) -> int:
     ]
     tasks = [t for k, t in mapping if counts.get(k, 0) < total]
     if not tasks:
-        print("All artifacts present")
+        if getattr(ns, "output_format", "text") == "json":
+            print(json.dumps({
+                "command": "finish",
+                "directory": str(root),
+                "status": "complete",
+                "all_present": True,
+                "pending_tasks": [],
+            }, indent=2))
+        else:
+            print("All artifacts present")
         return 0
-    ns_batch = SimpleNamespace(
+    ns_batch = argparse.Namespace(
         directory=str(root),
         recursive=ns.recursive,
         tasks=",".join(tasks),
@@ -3399,10 +3783,19 @@ def cmd_finish(ns) -> int:
         subtitles_translate=False,
         force=False,
     )
-    return cmd_batch(ns_batch)
+    rc = cmd_batch(ns_batch)
+    if getattr(ns, "output_format", "text") == "json":
+        print(json.dumps({
+            "command": "finish",
+            "directory": str(root),
+            "status": "started",
+            "pending_tasks": tasks,
+            "batch_rc": rc,
+        }, indent=2))
+    return rc
     # The generate_report function is similar to the logic in cmd_report, but is used internally for the "finish" command to compute which artifact tasks are incomplete. It is not strictly necessary if you refactor cmd_report to return its summary instead of printing, but currently both exist for separation of CLI output and internal logic.
 
-def cmd_metadata(ns) -> int:
+def cmd_metadata(ns: argparse.Namespace) -> int:
     """Generate ffprobe metadata JSON sidecars for each video."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -3419,7 +3812,16 @@ def cmd_metadata(ns) -> int:
         print("Errors (some files may be incomplete):", file=sys.stderr)
         for e in result["errors"]:
             print("  " + e, file=sys.stderr)
-    print(f"Metadata done for {result['total']} file(s)")
+    if getattr(ns, "output_format", "text") == "json":
+        print(json.dumps({
+            "command": "metadata",
+            "directory": str(root),
+            "total": result['total'],
+            "errors": result['errors'],
+            "force": bool(ns.force),
+        }, indent=2))
+    else:
+        print(f"Metadata done for {result['total']} file(s)")
     return 0
 
 def video_tags_path(video: Path) -> Path:
@@ -3447,7 +3849,7 @@ def save_video_tags(video: Path, data: dict) -> None:
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, p)
 
-def cmd_tags(ns) -> int:
+def cmd_tags(ns: argparse.Namespace) -> int:
     """List or apply tags to videos. Performer tags derived from face listing cache.
 
     Workflow:
@@ -3544,7 +3946,7 @@ def cmd_tags(ns) -> int:
                 print(f"Warning: failed to write tags for {v.name}: {e}", file=sys.stderr)
         results.append(rec)
     if ns.output_format == "json":
-        print(json.dumps({"videos": results}, indent=2))
+        print(json.dumps({"command": "tags", "directory": str(root), "videos": results}, indent=2))
     else:
         for r in results:
             tags = ",".join(sorted(r.get("tags", [])))
@@ -3562,6 +3964,237 @@ def resolve_directory(ns):
 
 # Unified command name set (keep in sync with subparsers)
 COMMAND_NAMES = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish","tags"}
+
+# Short one-line help summaries (synchronized with argparse definitions)
+COMMAND_HELP: dict[str, str] = {
+    "list": "List MP4 files",
+    "metadata": "Generate ffprobe metadata JSON files",
+    "thumbs": "Generate single thumbnails",
+    "sprites": "Generate sprite sheet + JSON index",
+    "previews": "Generate short preview clips",
+    "subtitles": "Transcribe audio to subtitles (Whisper)",
+    "batch": "Ephemeral multi-task pipeline",
+    "phash": "Compute perceptual hashes",
+    "dupes": "Find likely duplicate videos",
+    "heatmaps": "Compute brightness/motion heatmaps",
+    "scenes": "Detect scene boundaries",
+    "embed": "Extract per-video face signatures",
+    "listing": "Global face signature index",
+    "rename": "Single-file or batch rename",
+    "codecs": "Scan codec/profile compatibility",
+    "transcode": "Batch transcode toward targets",
+    "compare": "Compare two video files",
+    "report": "Report artifact coverage",
+    "orphans": "List/delete orphan artifacts",
+    "finish": "Generate missing artifacts",
+    "tags": "Apply or list tags",
+    "doctor": "Environment diagnostics",
+    "sample": "Generate synthetic sample videos",
+}
+
+def _cmd_rename_batch(ns) -> int:  # noqa: C901
+    import re
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    if not ns.source or not ns.target:
+        print("Error: --source and --target required in --batch mode", file=sys.stderr)
+        return 2
+    pattern = ns.source if ns.regex else re.escape(ns.source)
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        print(f"Invalid pattern: {e}", file=sys.stderr)
+        return 1
+    if ns.ext == '*':
+        candidates = root.rglob('*') if ns.recursive else root.glob('*')
+    else:
+        pat = f"**/*{ns.ext}" if ns.recursive else f"*{ns.ext}"
+        candidates = root.glob(pat)
+    planned: list[dict] = []
+    for f in candidates:
+        if not f.is_file():
+            continue
+        new_name = regex.sub(ns.target, f.name)
+        if new_name != f.name:
+            target = f.with_name(new_name)
+            planned.append({"from": str(f), "to": str(target)})
+            if ns.limit and len(planned) >= ns.limit:
+                break
+    applied = 0
+    errors: list[str] = []
+    if ns.force:
+        for item in planned:
+            src = Path(item['from'])
+            dst = Path(item['to'])
+            if dst.exists():
+                errors.append(f"target exists: {dst}")
+                continue
+            try:
+                src.rename(dst)
+                # Always attempt artifact sidecar rename
+                art = src.parent / ARTIFACTS_DIR
+                if art.exists():
+                    old_stem = src.stem
+                    new_stem = dst.stem
+                    for side in art.glob(f"{old_stem}.*"):
+                        new_side_name = side.name.replace(old_stem, new_stem, 1)
+                        new_side = side.with_name(new_side_name)
+                        if new_side.exists():
+                            continue
+                        try:
+                            side.rename(new_side)
+                        except Exception:  # noqa: BLE001
+                            pass
+                applied += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(str(e))
+    first = planned[0] if planned else None
+    if ns.output_format == 'json':
+        out: dict[str, Any] = {"total_matches": len(planned), "applied": applied, "dry_run": not ns.force, "first": first}
+        if ns.show_all:
+            out['renames'] = planned
+        if errors:
+            out['errors'] = errors
+        print(json.dumps(out, indent=2))
+    else:
+        if not planned:
+            print("No matches")
+            return 0
+        if first is not None:
+            print(f"First: {first['from']} -> {first['to']}")
+        if ns.show_all:
+            for r in planned:
+                print(f"{r['from']} -> {r['to']}")
+        print(f"Planned: {len(planned)} | Applied: {applied} | Mode: {'write' if ns.force else 'dry-run'}")
+        if errors:
+            print("Errors:")
+            for e in errors:
+                print(f"  - {e}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# Logging & global output controls
+# ---------------------------------------------------------------------------
+
+_LOG_FILE_HANDLE = None
+
+def _log_event(ns: argparse.Namespace, event: str, **payload):
+    """Write a structured log event if --log specified.
+
+    Default format jsonl; text is a simple key=value line.
+    """
+    global _LOG_FILE_HANDLE  # noqa: PLW0603
+    if getattr(ns, 'log_file', None) is None:
+        return
+    if _LOG_FILE_HANDLE is None:
+        try:
+            _LOG_FILE_HANDLE = open(ns.log_file, 'a', encoding='utf-8')
+        except Exception:
+            return
+    ts = time.time()
+    record = {"ts": ts, "event": event, "command": getattr(ns, 'cmd', None), **payload}
+    try:
+        if ns.log_format == 'jsonl':
+            _LOG_FILE_HANDLE.write(json.dumps(record, separators=(',',':')) + "\n")
+        else:
+            kv = ' '.join(f"{k}={v}" for k,v in record.items())
+            _LOG_FILE_HANDLE.write(kv + "\n")
+        _LOG_FILE_HANDLE.flush()
+    except Exception:
+        pass
+
+def _print(ns: argparse.Namespace, *a, **k):
+    if getattr(ns, 'quiet', False):
+        return
+    print(*a, **k)
+
+# ---------------------------------------------------------------------------
+# Doctor command
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(ns: argparse.Namespace) -> int:
+    import platform, shutil
+    data = {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "ffprobe": bool(shutil.which('ffprobe')),
+        "ffmpeg": bool(shutil.which('ffmpeg')),
+        "opencv": _module_version('cv2'),
+        "numpy": _module_version('numpy'),
+        "pyscenedetect": _module_version('scenedetect'),
+        "deepface": _module_version('deepface'),
+        "hardware_encoders": _detect_hw_encoders(),
+    }
+    if ns.output_format == 'json':
+        print(json.dumps({"command": "doctor", **data}, indent=2))
+    else:
+        for k,v in data.items():
+            _print(ns, f"{k}: {v}")
+    _log_event(ns, 'doctor', **data)
+    return 0
+
+def _module_version(name: str):
+    try:
+        mod = __import__(name)
+        return getattr(mod, '__version__', 'present')
+    except Exception:
+        return None
+
+def _detect_hw_encoders():
+    encoders = []
+    if ffmpeg_available():
+        try:
+            proc = subprocess.run(['ffmpeg','-hide_banner','-encoders'], capture_output=True, text=True, timeout=5)
+            text = proc.stdout + proc.stderr
+            if 'h264_videotoolbox' in text: encoders.append('h264_videotoolbox')
+            if 'hevc_videotoolbox' in text: encoders.append('hevc_videotoolbox')
+            if 'av1_nvenc' in text: encoders.append('av1_nvenc')
+            if 'h264_nvenc' in text: encoders.append('h264_nvenc')
+        except Exception:
+            pass
+    return encoders
+
+# ---------------------------------------------------------------------------
+# Sample command
+# ---------------------------------------------------------------------------
+
+def cmd_sample(ns: argparse.Namespace) -> int:
+    root = Path(ns.directory).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    count = max(1, ns.count)
+    created = []
+    for i in range(count):
+        name = f"sample_{i+1:02d}.mp4"
+        path = root / name
+        if os.environ.get('FFPROBE_DISABLE') or not ffmpeg_available():
+            # stub tiny file
+            path.write_bytes(b"00")
+            created.append(str(path))
+            continue
+        dur = max(0.5, ns.duration)
+        w = ns.width; h = ns.height
+        # color test pattern moving box
+        cmd = [
+            'ffmpeg','-y','-v','error','-f','lavfi','-i',f"testsrc=size={w}x{h}:rate=30",
+            '-t',f"{dur}", str(path)
+        ]
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode == 0:
+            created.append(str(path))
+        else:
+            # fallback stub
+            path.write_bytes(b"00")
+            created.append(str(path))
+    result = {"command": "sample", "directory": str(root), "created": created, "count": len(created)}
+    if ns.output_format == 'json':
+        print(json.dumps(result, indent=2))
+    else:
+        _print(ns, f"Created {len(created)} sample video(s) in {root}")
+        for c in created: _print(ns, '  ', Path(c).name)
+    _log_event(ns, 'sample', created=len(created), directory=str(root))
+    return 0
 
 def dispatch_command(ns) -> int:
     if ns.cmd == "list": return cmd_list(ns)
@@ -3584,14 +4217,24 @@ def dispatch_command(ns) -> int:
     if ns.cmd == "compare": return cmd_compare(ns)
     if ns.cmd == "embed": return cmd_faces_embed(ns)
     if ns.cmd == "listing":
-        cmd_faces_index(ns)
-        return 0
+        return cmd_faces_index(ns)
     if ns.cmd == "tags": return cmd_tags(ns)
+    if ns.cmd == "doctor": return cmd_doctor(ns)
+    if ns.cmd == "sample": return cmd_sample(ns)
     print("Unknown command", file=sys.stderr)
     return 1
 
 def main(argv: List[str] | None = None) -> int:
     raw_args = argv or sys.argv[1:]
+    # Standalone --list-commands (before full argparse which demands a subcommand)
+    if "--list-commands" in raw_args and not any(a in COMMAND_NAMES for a in raw_args):
+        for name in sorted(COMMAND_NAMES):
+            help_txt = COMMAND_HELP.get(name, "")
+            if help_txt:
+                print(f"{name:10s} - {help_txt}")
+            else:
+                print(name)
+        return 0
     # Multi-command (comma separated) convenience without recursive main calls.
     # Forms supported:
     #   index.py /path thumbs,sprites
@@ -3636,6 +4279,14 @@ def main(argv: List[str] | None = None) -> int:
                         overall_rc = rc
                 return overall_rc
     ns = parse_args(raw_args)
+    if getattr(ns, "list_commands", False):
+        for name in sorted(COMMAND_NAMES):
+            help_txt = COMMAND_HELP.get(name, "")
+            if help_txt:
+                print(f"{name:10s} - {help_txt}")
+            else:
+                print(name)
+        return 0
     # Fallback: user supplied directory then command (e.g. './index.py /path orphans')
     if ns.cmd not in COMMAND_NAMES and raw_args:
         first = raw_args[0]
