@@ -3,12 +3,12 @@
 
 Functions:
   list   - List .mp4 files with optional recursion / JSON / sizes.
-  meta   - Generate ffprobe metadata JSON files for .mp4s.
+  metadata   - Generate ffprobe metadata JSON files for .mp4s.
            (Skips existing unless --force.)
   
 
 The 'queue' command is an ephemeral in-memory scheduler to avoid CPU thrash on
-low-power devices. It discovers files (like meta) then processes them with a
+low-power devices. It discovers files (like metadata) then processes them with a
 thread pool (default 1 worker).
 
 Metadata Output:
@@ -29,6 +29,7 @@ Exit Codes:
 """
 from __future__ import annotations
 import argparse
+import math
 import json
 import os
 import sys
@@ -45,6 +46,12 @@ try:  # Optional dependency; many commands work without OpenCV
 except ImportError:  # pragma: no cover - fallback when opencv-python not installed
     cv2 = None
 import numpy as np
+import warnings
+
+# Focused deprecation suppression: limit to known noisy modules (pkg_resources / deprecated distutils in deps)
+with warnings.catch_warnings():  # pragma: no cover
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"pkg_resources")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"distutils")
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 np.random.seed(0)
@@ -66,18 +73,17 @@ def cluster_faces(
 ):
     """Detect faces in videos and cluster them by similarity.
 
-    Requires optional heavy deps: opencv-python, face_recognition, scikit-learn.
-    Returns dict[label] -> list occurrences {video, timestamp, bbox{top,right,bottom,left}}.
+    Returns dict[label] -> list occurrences. If heavy dependencies are missing,
+    raises a RuntimeError so caller can decide how to degrade.
     """
     try:
         import cv2  # type: ignore
-        import numpy as np  # type: ignore
-        from sklearn.cluster import DBSCAN  # type: ignore
         import face_recognition  # type: ignore
+        from sklearn.cluster import DBSCAN  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("face clustering requires cv2, face_recognition and scikit-learn") from exc
-    embeddings = []
-    occurrences = []
+    embeddings: list[np.ndarray] = []
+    occurrences: list[dict] = []
     for video in videos:
         cap = cv2.VideoCapture(str(video))
         if not cap.isOpened():
@@ -107,16 +113,160 @@ def cluster_faces(
         cap.release()
     if not embeddings:
         return {}
-    import numpy as np  # type: ignore
-    data = np.vstack(embeddings)
+    data = np.vstack(embeddings).astype("float32")
     norms = np.linalg.norm(data, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     normalized = data / norms
     labels = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean").fit_predict(normalized)
-    clusters = {}
-    for label, occ in zip(labels, occurrences):
-        clusters.setdefault(int(label), []).append(occ)
+    clusters: dict[int, list[dict]] = {}
+    for lab, occ in zip(labels, occurrences):
+        clusters.setdefault(int(lab), []).append(occ)
     return clusters
+
+
+def extract_distinct_face_signatures(
+    video: Path,
+    sample_rate: float = 1.0,
+    min_face_area: int = 0,
+    blur_threshold: float = 0.0,
+    max_gap: float = 0.5,
+    min_track_frames: int = 2,
+    match_distance: float = 0.6,
+    cluster_eps: float = 0.45,
+    cluster_min_samples: int = 1,
+) -> list[dict]:
+    """Return representative face signature tracks for a single video.
+
+    Simplified lightweight implementation: detects faces on sampled frames,
+    obtains embeddings (if heavy deps present) and clusters them with DBSCAN.
+    In test/stub mode (FFPROBE_DISABLE) or missing deps returns empty list.
+    """
+    if os.environ.get("FFPROBE_DISABLE"):
+        return []
+    try:
+        import cv2  # type: ignore
+        import face_recognition  # type: ignore
+        from sklearn.cluster import DBSCAN  # type: ignore
+    except Exception:
+        return []
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    step = max(int(round(fps / max(sample_rate, 0.1))), 1)
+    frame_idx = 0
+    embeddings: list[np.ndarray] = []
+    times: list[float] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % step == 0:
+            rgb = frame[:, :, ::-1]
+            boxes = face_recognition.face_locations(rgb)
+            if boxes:
+                encs = face_recognition.face_encodings(rgb, boxes)
+                ts = frame_idx / fps
+                for enc in encs:
+                    embeddings.append(enc)
+                    times.append(ts)
+        frame_idx += 1
+    cap.release()
+    if not embeddings:
+        return []
+    arr = np.vstack(embeddings).astype("float32")
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    arr = arr / norms
+    try:
+        labels = DBSCAN(eps=cluster_eps, min_samples=cluster_min_samples, metric="euclidean").fit_predict(arr)
+    except Exception:
+        labels = np.arange(len(arr))
+    groups: dict[int, list[int]] = {}
+    for i, lab in enumerate(labels):
+        groups.setdefault(int(lab), []).append(i)
+    results: list[dict] = []
+    for lab, idxs in groups.items():
+        seg = arr[idxs]
+        rep = seg.mean(axis=0)
+        rep = rep / (np.linalg.norm(rep) or 1.0)
+        start_t = min(times[i] for i in idxs)
+        end_t = max(times[i] for i in idxs)
+        frames = len(idxs)
+        results.append({
+            "id": f"p{lab}" if lab >= 0 else f"n{abs(lab)}",
+            "start_t": start_t,
+            "end_t": end_t,
+            "frames": frames,
+            "embedding": [float(x) for x in rep.tolist()],
+        })
+    return results
+
+
+def build_face_index(
+    root: Path,
+    recursive: bool = False,
+    sample_rate: float = 1.0,
+    **kwargs,
+) -> dict:
+    """Iterate videos under root and build a deduplicated face index.
+
+    Returns {"people": [{"id", "embedding", "occurrences": [{video,start_t,end_t,frames}]}], "videos": count}.
+    Uses extract_distinct_face_signatures per video then clusters globally.
+    """
+    videos = []
+    if recursive:
+        for p in root.rglob("*.mp4"):
+            videos.append(p)
+    else:
+        videos = [p for p in root.glob("*.mp4") if p.is_file()]
+    all_entries: list[dict] = []
+    for v in videos:
+        sigs = extract_distinct_face_signatures(v, sample_rate=sample_rate, **kwargs)
+        for s in sigs:
+            s2 = dict(s)
+            s2["video"] = v.name
+            all_entries.append(s2)
+    if not all_entries:
+        return {"people": [], "videos": len(videos)}
+    # Global clustering of embeddings to dedupe across videos
+    try:
+        from sklearn.cluster import DBSCAN  # type: ignore
+        embs = np.vstack([np.array(e["embedding"], dtype="float32") for e in all_entries])
+        labels = DBSCAN(eps=kwargs.get("cluster_eps", 0.45), min_samples=kwargs.get("cluster_min_samples", 1), metric="euclidean").fit_predict(embs)
+        grouped: dict[int, list[int]] = {}
+        for idx, lab in enumerate(labels):
+            grouped.setdefault(int(lab), []).append(idx)
+        people = []
+        for lab, idxs in grouped.items():
+            arr = embs[idxs]
+            rep = arr.mean(axis=0)
+            rep = rep / (np.linalg.norm(rep) or 1.0)
+            occs = []
+            for i in idxs:
+                e = all_entries[i]
+                occs.append({
+                    "video": e["video"],
+                    "start_t": e["start_t"],
+                    "end_t": e["end_t"],
+                    "frames": e["frames"],
+                })
+            people.append({
+                "id": f"g{lab}" if lab >= 0 else f"gneg{abs(lab)}",
+                "embedding": [float(x) for x in rep.tolist()],
+                "occurrences": occs,
+            })
+        return {"people": people, "videos": len(videos)}
+    except Exception:
+        # Fallback: no global clustering
+        people = []
+        for idx, e in enumerate(all_entries):
+            people.append({
+                "id": f"u{idx}",
+                "embedding": e["embedding"],
+                "occurrences": [{"video": e["video"], "start_t": e["start_t"], "end_t": e["end_t"], "frames": e["frames"]}],
+            })
+        return {"people": people, "videos": len(videos)}
 
 fMEDIA_EXTS = {".mp4"}
 
@@ -128,9 +278,9 @@ def artifact_dir(media_path: Path) -> Path:
     return d
 
 def subtitles_path_candidates(media_path: Path):
+    # Store SRT in artifact directory as <stem>.srt (e.g. sample.srt for sample.mp4)
     d = artifact_dir(media_path)
-    stem = media_path.stem
-    return [d / f"{stem}.srt"]
+    return [d / f"{media_path.stem}.srt"]
 
 def find_subtitles(media_path: Path):
     for p in subtitles_path_candidates(media_path):
@@ -206,7 +356,7 @@ def build_record(path: Path) -> Dict[str, Any]:
 def metadata_path(video: Path) -> Path:
     return artifact_dir(video) / f"{video.stem}.ffprobe.json"
 
-def thumb_path(video: Path) -> Path:
+def thumbs_path(video: Path) -> Path:
     return artifact_dir(video) / f"{video.stem}.jpg"
 
 
@@ -246,18 +396,31 @@ def run_ffprobe(video: Path) -> Dict[str, Any]:
 def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int = 1) -> Dict[str, Any]:
     videos = list(videos)
     total = len(videos)
-    done = 0
+    done = 0  # number of videos examined (generated or skipped)
+    generated = 0  # number of metadata JSON files actually (re)written this run
     errors: list[str] = []
 
     # Worker design: queue file paths, each worker writes file.
     q: Queue[Path] = Queue()
+    # Pre-scan to count existing artifacts to provide summary line
+    existing = 0
     for v in videos:
+        if (not force) and metadata_path(v).exists():
+            existing += 1
         q.put(v)
+
+    remaining = total - existing if not force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"metadata: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force to regenerate).", file=sys.stderr)
+    else:
+        print(f"metadata: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
 
     lock = threading.Lock()
 
     def worker():
         nonlocal done
+        nonlocal generated
         while True:
             try:
                 v = q.get_nowait()
@@ -265,11 +428,22 @@ def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int 
                 return
             try:
                 out_path = metadata_path(v)
+                wrote = False
                 if out_path.exists() and not force:
+                    # skip
                     pass
                 else:
                     data = run_ffprobe(v)
                     out_path.write_text(json.dumps(data, indent=2))
+                    wrote = True
+                if wrote:
+                    with lock:
+                        generated += 1
+                        # Show cumulative covered (existing + generated) over total
+                        covered = existing + generated if not force else generated
+                        if covered > total:
+                            covered = total
+                        print(f"metadata gen {covered}/{total} {v.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{v}: {e}")
@@ -283,12 +457,24 @@ def generate_metadata(videos: Iterable[Path], force: bool = False, workers: int 
     for t in threads:
         t.start()
     # Simple progress loop
-    while any(t.is_alive() for t in threads):
-        print(f"Progress: {done}/{total}\r", end="", file=sys.stderr)
-        time.sleep(0.2)
+    # Only show a rolling progress line if work remains
+    if remaining > 0:
+        while any(t.is_alive() for t in threads):
+            with lock:
+                covered = existing + generated if not force else generated
+                if covered > total:
+                    covered = total
+                print(f"metadata scan {covered}/{total} (generated {generated})\r", end="", file=sys.stderr)
+            time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"Progress: {done}/{total}", file=sys.stderr)
+    if remaining > 0:
+        covered = existing + generated if not force else generated
+        if covered > total:
+            covered = total
+        print(f"metadata scan {covered}/{total} (generated {generated})", file=sys.stderr)
+    if not errors:
+        print(f"metadata: generated {generated} file(s), skipped {total - generated} (existing)", file=sys.stderr)
     return {"total": total, "errors": errors}
 
  
@@ -318,9 +504,9 @@ def parse_time_spec(time_spec: str, duration: float | None) -> float:
         return 1.0
 
 
-def extract_duration(meta_json: Dict[str, Any]) -> float | None:
+def extract_duration(metadata_json: Dict[str, Any]) -> float | None:
     # ffprobe format.duration is a string
-    fmt = meta_json.get("format") if isinstance(meta_json, dict) else None
+    fmt = metadata_json.get("format") if isinstance(metadata_json, dict) else None
     if isinstance(fmt, dict):
         dur = fmt.get("duration")
         try:
@@ -333,23 +519,24 @@ def extract_duration(meta_json: Dict[str, Any]) -> float | None:
     return None
 
 
-def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -> None:
-    out = thumb_path(video)
+def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -> bool:
+    """Generate thumbnail; return True if (re)generated, False if skipped."""
+    out = thumbs_path(video)
     if out.exists() and not force:
-        return
+        return False
     duration = None
-    meta_file = metadata_path(video)
-    if meta_file.exists():
+    metadata_file = metadata_path(video)
+    if metadata_file.exists():
         try:
-            meta = json.loads(meta_file.read_text())
-            duration = extract_duration(meta)
+            metadata = json.loads(metadata_file.read_text())
+            duration = extract_duration(metadata)
         except Exception:  # noqa: BLE001
             duration = None
     t = parse_time_spec(time_spec, duration)
     if os.environ.get("FFPROBE_DISABLE"):
         # stub mode writes a placeholder
         out.write_text(f"stub thumbnail for {video.name} at {t}s")
-        return
+        return True
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg not available")
     # Use -ss (seek) then -frames:v 1 to capture a single frame
@@ -364,10 +551,11 @@ def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "ffmpeg thumbnail failed")
+    return True
 
 
-def cmd_thumb(ns) -> int:
-    """Generate a single thumbnail per video (time chosen by --time) in parallel workers."""
+def cmd_thumbs(ns) -> int:
+    """Generate a single thumbnail per video (time chosen by --time) with skip-aware progress."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -376,23 +564,42 @@ def cmd_thumb(ns) -> int:
     if not videos:
         print("No MP4 files found.")
         return 0
-    errors: list[str] = []
+    total = len(videos)
+    # Pre-scan existing
+    existing = 0
     q: Queue[Path] = Queue()
     for v in videos:
+        if (not ns.force) and thumbs_path(v).exists():
+            existing += 1
         q.put(v)
-    processed = 0
-    total = len(videos)
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"thumbs: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force to regenerate).", file=sys.stderr)
+        print(f"Thumbs generated for 0 file(s)")
+        return 0
+    print(f"thumbs: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
+    errors: list[str] = []
+    processed = 0  # videos pulled from queue
+    generated = 0  # new thumbnails written
     lock = threading.Lock()
 
     def worker():
-        nonlocal processed
+        nonlocal processed, generated
         while True:
             try:
                 v = q.get_nowait()
             except Empty:
                 return
             try:
-                generate_thumbnail(v, ns.force, ns.time_spec, ns.quality)
+                created = generate_thumbnail(v, ns.force, ns.time_spec, ns.quality)
+                if created:
+                    with lock:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total:
+                            covered = total
+                        print(f"thumbs gen {covered}/{total} {v.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{v}: {e}")
@@ -406,16 +613,24 @@ def cmd_thumb(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
-        print(f"Thumb progress: {processed}/{total}\r", end="", file=sys.stderr)
-        time.sleep(0.2)
+        with lock:
+            covered = existing + generated if not ns.force else generated
+            if covered > total:
+                covered = total
+            print(f"thumbs scan {covered}/{total} (generated {generated})\r", end="", file=sys.stderr)
+        time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"Thumb progress: {processed}/{total}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total:
+            covered = total
+    print(f"thumbs scan {covered}/{total} (generated {generated})", file=sys.stderr)
     if errors:
-        print("Errors (some thumbnails missing):", file=sys.stderr)
+        print("Errors (some thumbs missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Thumbnails generated for {total - len(errors)} file(s)")
+    print(f"Thumbs generated for {generated} file(s)")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -531,7 +746,7 @@ def generate_sprite_sheet(video: Path, interval: float, width: int, cols: int, r
 
 
 def cmd_sprites(ns) -> int:
-    """Create sprite sheet + JSON index (grid of frames) for each video."""
+    """Create sprite sheet + JSON index (grid of frames) for each video (skip-aware)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -544,21 +759,46 @@ def cmd_sprites(ns) -> int:
     cols = max(1, ns.cols)
     rows = max(1, ns.rows)
     total = len(videos)
+    existing = 0
+    to_process: list[Path] = []
+    if ns.force:
+        to_process = videos[:]
+    else:
+        for v in videos:
+            s, j = sprite_sheet_paths(v)
+            if s.exists() and j.exists():
+                existing += 1
+            else:
+                to_process.append(v)
+    remaining = len(to_process)
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"sprites: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        print("Sprite sheets generated for 0 file(s)")
+        return 0
+    print(f"sprites: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
+    generated = 0
     processed = 0
     errors: list[str] = []
-    for v in videos:
-        ok, err = generate_sprite_sheet(v, interval, ns.width, cols, rows, ns.quality, ns.force, ns.max_frames)
+    for v in to_process:
+        ok, err = generate_sprite_sheet(v, interval, ns.width, cols, rows, ns.quality, True, ns.max_frames)
         processed += 1
         if not ok and err:
             errors.append(f"{v}: {err}")
-        print(f"Sprites {processed}/{total}\r", end="", file=sys.stderr)
-    print(f"Sprites {processed}/{total}", file=sys.stderr)
+        else:
+            generated += 1
+            covered = existing + generated if not ns.force else generated
+            if covered > total:
+                covered = total
+            print(f"sprites gen {covered}/{total} {v.name}", file=sys.stderr)
+        print(f"sprites scan {existing + generated}/{total} (generated {generated})\r", end="", file=sys.stderr)
+    print(f"sprites scan {existing + generated}/{total} (generated {generated})", file=sys.stderr)
     if errors:
         print("Errors (some sprite sheets missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Sprite sheets generated for {total - len(errors)} file(s)")
-    return 0
+    print(f"Sprite sheets generated for {generated} file(s)")
+    return 0 if not errors else 1
 
 # ---------------------------------------------------------------------------
 # Hover preview short clips (decile segments)
@@ -614,7 +854,7 @@ def build_preview_cmd(video: Path, start: float, duration: float, width: int, ou
 
 
 def cmd_previews(ns) -> int:
-    """Generate short hover preview clips (segmented) and an index JSON."""
+    """Generate short hover preview clips (segmented) and an index JSON (skip-aware)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -628,16 +868,43 @@ def cmd_previews(ns) -> int:
     elif not ffprobe_available():
         print("Warning: ffprobe not available; durations may be missing", file=sys.stderr)
     worker_count = max(1, min(ns.workers, 4))
+    total = len(videos)
+    existing = 0
     q: Queue[Path] = Queue()
     for v in videos:
+        if (not ns.force):
+            idx = preview_index_path(v)
+            if idx.exists():
+                try:
+                    data = json.loads(idx.read_text())
+                    segs_meta = data.get("segments", [])
+                    clip_dir = preview_output_dir(v)
+                    # If any referenced clip missing, treat as incomplete => regenerate
+                    all_present = True
+                    for s in segs_meta:
+                        fname = s.get("file")
+                        if fname and not (clip_dir / fname).exists():
+                            all_present = False
+                            break
+                    if all_present:
+                        existing += 1
+                except Exception:
+                    pass  # corrupted index -> regenerate
         q.put(v)
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"previews: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        print("Hover previews generated for 0 file(s)")
+        return 0
+    print(f"previews: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     processed = 0
-    total = len(videos)
+    generated = 0
     lock = threading.Lock()
     errors: list[str] = []
 
     def worker():
-        nonlocal processed
+        nonlocal processed, generated
         while True:
             try:
                 vid = q.get_nowait()
@@ -652,6 +919,7 @@ def cmd_previews(ns) -> int:
                 out_dir.mkdir(exist_ok=True)
                 clip_ext = ".mp4" if ns.format == "mp4" else ".webm"
                 index_entries = []
+                new_segments = False
                 for idx, start in enumerate(points, start=1):
                     out_file = out_dir / f"seg_{idx:02d}{clip_ext}"
                     if out_file.exists() and not ns.force:
@@ -660,6 +928,7 @@ def cmd_previews(ns) -> int:
                     if os.environ.get("FFPROBE_DISABLE"):
                         out_file.write_text(f"stub preview {vid.name} t={start:.2f}")
                         index_entries.append({"start": start, "file": out_file.name, "duration": ns.duration})
+                        new_segments = True
                         continue
                     if not ffmpeg_available():
                         raise RuntimeError("ffmpeg not available")
@@ -668,14 +937,25 @@ def cmd_previews(ns) -> int:
                     if proc.returncode != 0:
                         raise RuntimeError(proc.stderr.strip() or "ffmpeg preview failed")
                     index_entries.append({"start": start, "file": out_file.name, "duration": ns.duration})
+                    new_segments = True
+                wrote_any = False
                 if not ns.no_index:
-                    preview_index_path(vid).write_text(json.dumps({
-                        "video": vid.name,
-                        "format": ns.format,
-                        "segments": index_entries,
-                        "segment_duration": ns.duration,
-                        "generated_at": time.time(),
-                    }, indent=2))
+                    idx_path = preview_index_path(vid)
+                    if (not idx_path.exists()) or ns.force:
+                        idx_path.write_text(json.dumps({
+                            "video": vid.name,
+                            "format": ns.format,
+                            "segments": index_entries,
+                            "segment_duration": ns.duration,
+                            "generated_at": time.time(),
+                        }, indent=2))
+                        wrote_any = True
+                if wrote_any or (ns.no_index and new_segments):
+                    with lock:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total: covered = total
+                        print(f"previews gen {covered}/{total} {vid.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{vid}: {e}")
@@ -688,16 +968,36 @@ def cmd_previews(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
-        print(f"Previews {processed}/{total}\r", end="", file=sys.stderr)
+        with lock:
+            covered = existing + generated if not ns.force else generated
+            if covered > total: covered = total
+            print(f"previews scan {covered}/{total} (generated {generated})\r", end="", file=sys.stderr)
         time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"Previews {processed}/{total}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total: covered = total
+    print(f"previews scan {covered}/{total} (generated {generated})", file=sys.stderr)
     if errors:
         print("Errors (some previews missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Hover previews generated for {total - len(errors)} file(s)")
+    print(f"Hover previews generated for {generated} file(s)")
+    if ns.output_format == "json":
+        results = []
+        for v in videos:
+            idx = preview_index_path(v)
+            seg_count = 0
+            has_index = idx.exists()
+            if has_index:
+                try:
+                    data = json.loads(idx.read_text())
+                    seg_count = len(data.get("segments", []))
+                except Exception:
+                    has_index = False
+            results.append({"video": v.name, "has_index": has_index, "segments": seg_count})
+        print(json.dumps({"results": results}, indent=2))
     return 0
 
 # ---------------------------------------------------------------------------
@@ -763,7 +1063,7 @@ def run_whisper_backend(video: Path, backend: str, model_name: str, language: st
                 for s in seg_iter:
                     segments.append({"start": s.start, "end": s.end, "text": s.text})
                 if ct != initial_type:
-                    print(f"[subs] compute_type fallback: {initial_type} -> {ct}", file=sys.stderr)
+                    print(f"[subtitles] compute_type fallback: {initial_type} -> {ct}", file=sys.stderr)
                 return segments
             except Exception as e:  # noqa: BLE001
                 last_err = e
@@ -819,8 +1119,8 @@ def run_whisper_backend(video: Path, backend: str, model_name: str, language: st
     raise RuntimeError(f"Unknown backend {backend}")
 
 
-def cmd_subs(ns) -> int:
-    """Generate subtitles via whisper/whisper.cpp (stubbed when FFPROBE_DISABLE set)."""
+def cmd_subtitles(ns) -> int:
+    """Generate SRT subtitles only (skip-aware; counts existing)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -831,17 +1131,30 @@ def cmd_subs(ns) -> int:
         return 0
     backend = detect_backend(ns.backend)
     worker_count = max(1, min(ns.workers, 2))
+    out_dir_base = Path(ns.output_dir).expanduser().resolve() if ns.output_dir else None
+    total = len(videos)
+    existing = 0
     q: Queue[Path] = Queue()
     for v in videos:
+        out_dir = out_dir_base or artifact_dir(v)
+        out_file = out_dir / f"{v.stem}.srt"
+        if (not ns.force) and out_file.exists():
+            existing += 1
         q.put(v)
-    out_dir_base = Path(ns.output_dir).expanduser().resolve() if ns.output_dir else None
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"subtitles: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        print("Subtitles generated for 0 file(s)")
+        return 0
+    print(f"subtitles: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     processed = 0
-    total = len(videos)
+    generated = 0
     errors: list[str] = []
     lock = threading.Lock()
 
     def worker():
-        nonlocal processed
+        nonlocal processed, generated
         while True:
             try:
                 vid = q.get_nowait()
@@ -852,12 +1165,18 @@ def cmd_subs(ns) -> int:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_file = out_dir / f"{vid.stem}.srt"
                 if out_file.exists() and not ns.force:
-                    pass
+                    wrote = False
                 else:
-                    print(f"subs {vid.name}", file=sys.stderr)
                     segments = run_whisper_backend(vid, backend, ns.model, ns.language, ns.translate, ns.whisper_cpp_bin, ns.whisper_cpp_model, getattr(ns, "compute_type", None))
-                    text = format_segments(segments)
-                    out_file.write_text(text)
+                    srt_text = format_segments(segments)
+                    out_file.write_text(srt_text)
+                    wrote = True
+                if wrote:
+                    with lock:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total: covered = total
+                        print(f"subtitles gen {covered}/{total} {vid.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{vid}: {e}")
@@ -870,16 +1189,22 @@ def cmd_subs(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
-        print(f"Subs {processed}/{total} backend={backend}\r", end="", file=sys.stderr)
+        with lock:
+            covered = existing + generated if not ns.force else generated
+            if covered > total: covered = total
+            print(f"subtitles scan {covered}/{total} (generated {generated}) backend={backend}\r", end="", file=sys.stderr)
         time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"Subs {processed}/{total} backend={backend}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total: covered = total
+    print(f"subtitles scan {covered}/{total} (generated {generated}) backend={backend}", file=sys.stderr)
     if errors:
         print("Errors (some subtitles missing):", file=sys.stderr)
         for e in errors:
             print("  " + e, file=sys.stderr)
-    print(f"Subtitles generated for {total - len(errors)} file(s)")
+    print(f"Subtitles generated for {generated} file(s)")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -890,25 +1215,25 @@ class BatchJob:
     __slots__ = ("video", "task")
     def __init__(self, video: Path, task: str):
         self.video = video
-        self.task = task  # meta, thumb, sprites, previews, subs
+        self.task = task  # metadata, thumbs, sprites, previews, subtitles
 
 
 def artifact_exists(video: Path, task: str) -> bool:
-    if task == "meta":
+    if task == "metadata":
         return metadata_path(video).exists()
-    if task == "thumb":
-        return thumb_path(video).exists()
+    if task == "thumbs":
+        return thumbs_path(video).exists()
     if task == "sprites":
         s, j = sprite_sheet_paths(video)
         return s.exists() and j.exists()
     if task == "previews":
         return preview_index_path(video).exists() or preview_output_dir(video).exists()
-    if task == "subs":
+    if task == "subtitles":
         return (artifact_dir(video) / f"{video.stem}.srt").exists()
     if task == "phash":
         return phash_path(video).exists()
-    if task == "heatmap":
-        return heatmap_json_path(video).exists()
+    if task == "heatmaps":
+        return heatmaps_json_path(video).exists()
     if task == "scenes":
         return scenes_json_path(video).exists()
     if task == "faces":
@@ -918,10 +1243,10 @@ def artifact_exists(video: Path, task: str) -> bool:
 
 def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
     try:
-        if task == "meta":
+        if task == "metadata":
             if not meta_single(video, force=ns.force):
                 return True, None
-        elif task == "thumb":
+        elif task == "thumbs":
             generate_thumbnail(video, ns.force, "middle", 2)
         elif task == "sprites":
             ok, err = generate_sprite_sheet(video, ns.sprites_interval, ns.sprites_width, ns.sprites_cols, ns.sprites_rows, 4, ns.force, 0)
@@ -969,9 +1294,9 @@ def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
                 "segment_duration": _Tmp.duration,
                 "generated_at": time.time(),
             }, indent=2))
-        elif task == "subs":
-            backend = detect_backend(ns.subs_backend)
-            segments = run_whisper_backend(video, backend, ns.subs_model, ns.subs_language, ns.subs_translate, None, None, getattr(ns, "compute_type", None))
+        elif task == "subtitles":
+            backend = detect_backend(ns.subtitles_backend)
+            segments = run_whisper_backend(video, backend, ns.subtitles_model, ns.subtitles_language, ns.subtitles_translate, None, None, getattr(ns, "compute_type", None))
             text = format_segments(segments)
             artifact_dir(video).mkdir(exist_ok=True)
             (artifact_dir(video) / f"{video.stem}.srt").write_text(text)
@@ -980,7 +1305,7 @@ def run_task(video: Path, task: str, ns) -> tuple[bool, str | None]:
             compute_phash_video(video, frame_time_spec="middle", frames=5, force=ns.force, algo="ahash", combine="xor")
         elif task == "scenes":
             # Default: detect scenes only (no thumbs/clips) for speed
-            generate_scene_artifacts(video, threshold=0.4, limit=0, gen_thumbs=False, gen_clips=False, thumb_width=320, clip_duration=2.0, force=ns.force)
+            generate_scene_artifacts(video, threshold=0.4, limit=0, gen_thumbs=False, gen_clips=False, thumbs_width=320, clip_duration=2.0, force=ns.force)
         else:
             return False, f"Unknown task {task}"
         return True, None
@@ -1001,7 +1326,7 @@ def meta_single(video: Path, force: bool) -> bool:
 
 
 def cmd_batch(ns) -> int:
-    """Run a batch of artifact generators (meta, thumb, sprites, previews, subs) together."""
+    """Run a batch of artifact generators (metadata, thumbs, sprites, previews, subtitles) together."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1011,17 +1336,17 @@ def cmd_batch(ns) -> int:
         print("No MP4 files found.")
         return 0
     requested = [t.strip() for t in ns.tasks.split(',') if t.strip()]
-    valid = {"meta", "thumb", "sprites", "previews", "subs", "phash", "scenes"}
+    valid = {"metadata", "thumbs", "sprites", "previews", "subtitles", "phash", "scenes"}
     for t in requested:
         if t not in valid:
             print(f"Unknown task in --tasks: {t}", file=sys.stderr)
             return 2
     per_type_caps = {
-        "meta": max(1, ns.max_meta),
-        "thumb": max(1, ns.max_thumb),
+        "metadata": max(1, ns.max_meta),
+        "thumbs": max(1, ns.max_thumbs),
         "sprites": max(1, ns.max_sprites),
         "previews": max(1, ns.max_previews),
-        "subs": max(1, ns.max_subs),
+        "subtitles": max(1, ns.max_subtitles),
         "phash": max(1, ns.max_phash),
         "scenes": max(1, ns.max_scenes),
     }
@@ -1281,6 +1606,141 @@ def compute_phash_video(video: Path, frame_time_spec: str, frames: int, force: b
     return hex_hash
 
 
+def find_phash_duplicates(root: Path, recursive: bool = False, threshold: float = 0.90, limit: int = 0) -> dict:
+    """Scan existing *.phash.json artifacts and report likely duplicate pairs.
+
+    Similarity metric primary: 1 - (hamming_distance / bits).
+    Crossover (secondary metric): Jaccard index of set bits (intersection/union) to
+    express apparent degree of shared visual features when using multi-frame XOR.
+
+    Args:
+        root: Directory to scan for videos / artifacts.
+        recursive: Recurse into subdirectories.
+        threshold: Minimum similarity (0..1) to consider a pair a duplicate candidate.
+        limit: Optional max number of pairs to return (0 = no limit).
+
+    Returns:
+        dict with summary statistics, duplicate pairs, and grouped clusters.
+    """
+    root = root.expanduser().resolve()
+    videos = find_mp4s(root, recursive)
+    # Collect phashes (skip videos missing artifact)
+    entries: list[dict] = []
+    for v in videos:
+        p = phash_path(v)
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+            h_hex = data.get("phash")
+            if not isinstance(h_hex, str):
+                continue
+            bits_len = len(h_hex) * 4
+            h_int = int(h_hex, 16)
+            ones = h_int.bit_count()
+            entries.append({
+                "video": v.name,
+                "path": str(v),
+                "hex": h_hex,
+                "int": h_int,
+                "bits": bits_len,
+                "ones": ones,
+                "algorithm": data.get("algorithm"),
+            })
+        except Exception:
+            continue
+    n = len(entries)
+    pairs: list[dict] = []
+    # Group by bit width (only compare within same size / algorithm family)
+    by_bits: dict[int, list[int]] = {}
+    for idx, e in enumerate(entries):
+        by_bits.setdefault(e["bits"], []).append(idx)
+    for bits, idxs in by_bits.items():
+        m = len(idxs)
+        for i_pos in range(m):
+            i = idxs[i_pos]
+            ei = entries[i]
+            for j_pos in range(i_pos + 1, m):
+                j = idxs[j_pos]
+                ej = entries[j]
+                # (Optional) skip compare if algorithms differ producing differing bit distributions
+                if ei.get("algorithm") != ej.get("algorithm"):
+                    continue
+                xor = ei["int"] ^ ej["int"]
+                dist = xor.bit_count()
+                sim = 1.0 - (dist / bits) if bits else 0.0
+                if sim < threshold:
+                    continue
+                # crossover / Jaccard of set bits
+                inter = (ei["int"] & ej["int"]).bit_count()
+                union = ei["ones"] + ej["ones"] - inter
+                jaccard = inter / union if union else 1.0
+                pairs.append({
+                    "a": ei["video"],
+                    "b": ej["video"],
+                    "similarity": round(sim, 6),
+                    "distance": dist,
+                    "bits": bits,
+                    "crossover": round(jaccard, 6),
+                    "overlap_bits": inter,
+                    "ones_a": ei["ones"],
+                    "ones_b": ej["ones"],
+                    "algorithm": ei.get("algorithm"),
+                })
+    # Sort by descending similarity then ascending distance
+    pairs.sort(key=lambda r: (-r["similarity"], r["distance"]))
+    if limit > 0:
+        pairs = pairs[:limit]
+    # Build clusters via union-find
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent.get(x, x), x)
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for pinfo in pairs:
+        union(pinfo["a"], pinfo["b"])
+    clusters: dict[str, list[str]] = {}
+    for e in entries:
+        v = e["video"]
+        r = find(v)
+        clusters.setdefault(r, []).append(v)
+    # Filter clusters with >1 member
+    group_list: list[dict] = []
+    for rep, vids in clusters.items():
+        if len(vids) < 2:
+            continue
+        # Compute average pairwise similarity within cluster (only among returned pairs)
+        sims: list[float] = []
+        vids_set = set(vids)
+        for pinfo in pairs:
+            if pinfo["a"] in vids_set and pinfo["b"] in vids_set:
+                sims.append(pinfo["similarity"])
+        avg_sim = sum(sims) / len(sims) if sims else 1.0
+        group_list.append({
+            "representative": rep,
+            "videos": sorted(vids),
+            "count": len(vids),
+            "avg_similarity": round(avg_sim, 6),
+        })
+    group_list.sort(key=lambda g: (-g["avg_similarity"], -g["count"]))
+    return {
+        "root": str(root),
+        "videos_total": len(videos),
+        "with_phash": n,
+        "threshold": threshold,
+        "pairs": pairs,
+        "groups": group_list,
+    }
+
+
 def cmd_phash(ns) -> int:
     """Compute perceptual hash (single or multi-frame combined) for duplicates detection."""
     root = Path(ns.directory).expanduser().resolve()
@@ -1292,26 +1752,44 @@ def cmd_phash(ns) -> int:
         print("No MP4 files found.")
         return 0
     worker_count = max(1, min(ns.workers, 4))
+    total = len(videos)
+    existing = 0
     q: Queue[Path] = Queue()
     for v in videos:
+        if (not ns.force) and phash_path(v).exists():
+            existing += 1
         q.put(v)
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"phash: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        if ns.output_format == "json":
+            print(json.dumps({"results": []}, indent=2))
+        return 0
+    print(f"phash: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     done = 0
-    total = len(videos)
+    generated = 0
     lock = threading.Lock()
     errors: list[str] = []
     results: list[tuple[str, str]] = []  # (video name, hash)
 
     def worker():
-        nonlocal done
+        nonlocal done, generated
         while True:
             try:
                 vid = q.get_nowait()
             except Empty:
                 return
             try:
+                prev_exists = phash_path(vid).exists()
                 h = compute_phash_video(vid, ns.time, ns.frames, ns.force, algo=ns.algo, combine=ns.combine)
                 with lock:
                     results.append((vid.name, h))
+                    if (not prev_exists) or ns.force:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total: covered = total
+                        print(f"phash gen {covered}/{total} {vid.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{vid}: {e}")
@@ -1324,11 +1802,17 @@ def cmd_phash(ns) -> int:
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):
-        print(f"pHash {done}/{total}\r", end="", file=sys.stderr)
-        time.sleep(0.2)
+        with lock:
+            covered = existing + generated if not ns.force else generated
+            if covered > total: covered = total
+            print(f"phash scan {covered}/{total} (generated {generated})\r", end="", file=sys.stderr)
+        time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"pHash {done}/{total}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total: covered = total
+    print(f"phash scan {covered}/{total} (generated {generated})", file=sys.stderr)
     if ns.output_format == "json":
         print(json.dumps({"results": [{"video": v, "phash": h} for v, h in results]}, indent=2))
     else:
@@ -1340,13 +1824,55 @@ def cmd_phash(ns) -> int:
             print("  " + e, file=sys.stderr)
     return 0 if not errors else 1
 
+
+def cmd_phash_dupes(ns) -> int:
+    """Report likely duplicate video pairs using existing pHash artifacts.
+
+    Requires that phash artifacts already exist (run 'phash' first). Outputs
+    similarity (1 - hamming/bits) and crossover (Jaccard of set bits) stats.
+    """
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    data = find_phash_duplicates(root, ns.recursive, ns.threshold, ns.limit)
+    if ns.output_format == "json":
+        print(json.dumps(data, indent=2))
+    else:
+        pairs = data.get("pairs", [])
+        if not pairs:
+            print("No duplicate candidates above threshold")
+        else:
+            for p in pairs:
+                print(f"{p['similarity']:.4f} crossover={p['crossover']:.4f} {p['a']} <> {p['b']} bits={p['bits']} dist={p['distance']}")
+            # groups summary
+            groups = data.get("groups", [])
+            if groups:
+                print("\nGroups:")
+                for g in groups:
+                    print(f"{g['avg_similarity']:.4f} x{g['count']} {', '.join(g['videos'])}")
+    return 0
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
+    # Preprocess to allow directory-first style: index.py /path command ...
+    if argv:
+        try:
+            first = Path(argv[0])
+            # Known command names set (keep in sync with subparsers)
+            # Keep this synchronized with the set in main(); only current, supported commands (no legacy aliases)
+            command_names = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish"}
+            if first.exists() and len(argv) > 1 and argv[1] in command_names:
+                # Swap to command-first
+                argv = [argv[1], *argv[2:], str(first)]
+            # Also support form: command path (original default) so no change needed.
+        except Exception:  # noqa: BLE001
+            pass
     p = argparse.ArgumentParser(description="Video utility (list, metadata)")
-    p.add_argument("-d", "--dir", dest="root_dir", default=None, help="Root directory for commands")
+    p.add_argument("-d", "--dir", dest="root_dir", default=None, help="Root directory for commands (alternate to positional directory)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List mp4 files")
@@ -1356,13 +1882,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     lp.add_argument("--show-size", action="store_true")
     lp.add_argument("--sort", choices=["name", "size"], default="name")
 
-    mp = sub.add_parser("meta", help="Generate ffprobe metadata for mp4 files (multi-threaded)")
+    mp = sub.add_parser("metadata", help="Generate ffprobe metadata for mp4 files (multi-threaded)")
     mp.add_argument("directory", nargs="?", default=".")
     mp.add_argument("-r", "--recursive", action="store_true")
     mp.add_argument("--force", action="store_true", help="Regenerate even if output exists")
     mp.add_argument("--workers", type=int, default=1)
 
-    tp = sub.add_parser("thumb", help="Generate cover thumbnails (JPEG)")
+    tp = sub.add_parser("thumbs", help="Generate cover thumbnails (JPEG)")
     tp.add_argument("directory", nargs="?", default=".")
     tp.add_argument("-r", "--recursive", action="store_true")
     tp.add_argument("--time", dest="time_spec", default="middle", help="When to capture frame: seconds (e.g. 10), percentage (e.g. 25%), or 'middle' (default)")
@@ -1393,8 +1919,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     hp.add_argument("--workers", type=int, default=2, help="Worker threads (cap 4)")
     hp.add_argument("--force", action="store_true", help="Regenerate existing previews")
     hp.add_argument("--no-index", action="store_true", help="Skip writing index JSON")
+    hp.add_argument("--output-format", choices=["json","text"], default="text")
 
-    sb = sub.add_parser("subs", help="Generate subtitles via Whisper (whisper / faster-whisper / whisper.cpp)")
+    sb = sub.add_parser("subtitles", help="Generate SRT subtitles via Whisper (whisper / faster-whisper / whisper.cpp)")
     sb.add_argument("directory", nargs="?", default=".")
     sb.add_argument("-r", "--recursive", action="store_true")
     sb.add_argument("--model", default="small", help="Model name (default small)")
@@ -1408,15 +1935,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sb.add_argument("--whisper-cpp-model", default=None, help="Path to whisper.cpp model (.bin)")
     sb.add_argument("--compute-type", default=None, help="faster-whisper compute type override (auto=int8 if translate else float16). Fallbacks applied if unsupported.")
 
-    bt = sub.add_parser("batch", help="Ephemeral multi-stage pipeline (meta/thumb/sprites/previews/subs) with per-type concurrency caps")
+    bt = sub.add_parser("batch", help="Ephemeral multi-stage pipeline (metadata/thumbs/sprites/previews/subtitles) with per-type concurrency caps")
     bt.add_argument("directory", nargs="?", default=".")
     bt.add_argument("-r", "--recursive", action="store_true")
-    bt.add_argument("--tasks", default="meta,thumb", help="Comma list of tasks: meta,thumb,sprites,previews,subs,phash (default meta,thumb)")
-    bt.add_argument("--max-meta", type=int, default=3)
-    bt.add_argument("--max-thumb", type=int, default=4)
+    bt.add_argument("--tasks", default="metadata,thumbs", help="Comma list of tasks: metadata,thumbs,sprites,previews,subtitles,phash (default metadata,thumbs)")
+    bt.add_argument("--max-metadata", type=int, default=3)
+    bt.add_argument("--max-thumbs", type=int, default=4)
     bt.add_argument("--max-sprites", type=int, default=2)
     bt.add_argument("--max-previews", type=int, default=2)
-    bt.add_argument("--max-subs", type=int, default=1)
+    bt.add_argument("--max-subtitles", type=int, default=1)
     bt.add_argument("--max-phash", type=int, default=4)
     bt.add_argument("--max-scenes", type=int, default=1)
     bt.add_argument("--preview-width", type=int, default=320)
@@ -1426,10 +1953,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     bt.add_argument("--sprites-width", type=int, default=320)
     bt.add_argument("--sprites-cols", type=int, default=10)
     bt.add_argument("--sprites-rows", type=int, default=10)
-    bt.add_argument("--subs-model", default="small")
-    bt.add_argument("--subs-backend", default="auto")
-    bt.add_argument("--subs-language", default=None)
-    bt.add_argument("--subs-translate", action="store_true")
+    bt.add_argument("--subtitles-model", default="small")
+    bt.add_argument("--subtitles-backend", default="auto")
+    bt.add_argument("--subtitles-language", default=None)
+    bt.add_argument("--subtitles-translate", action="store_true")
     bt.add_argument("--force", action="store_true", help="Force regenerate all artifacts")
 
     ph = sub.add_parser("phash", help="Compute perceptual hash for video(s) for deduplication")
@@ -1443,7 +1970,41 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     ph.add_argument("--algo", choices=["ahash","dct"], default="ahash", help="Frame hash algorithm: ahash (32x32 avg) or dct (classic 8x8 pHash) (default ahash)")
     ph.add_argument("--combine", choices=["xor","majority","avg"], default="xor", help="Combine multi-frame hashes: xor (fast), majority/avg (bit vote) (default xor)")
 
-    hm = sub.add_parser("heatmap", help="Generate brightness/motion heatmap timeline JSON (and optional PNG)")
+    phd = sub.add_parser("dupes", help="Find likely duplicate videos using existing pHash artifacts")
+    phd.add_argument("directory", nargs="?", default=".")
+    phd.add_argument("-r", "--recursive", action="store_true")
+    phd.add_argument("--threshold", type=float, default=0.90, help="Minimum similarity (0-1) (default 0.90)")
+    phd.add_argument("--limit", type=int, default=0, help="Limit number of pairs reported (0 = all)")
+    phd.add_argument("--output-format", choices=["json","text"], default="json")
+
+    fe = sub.add_parser("embed", help="Extract distinct face signatures per video (tracking + clustering)")
+    fe.add_argument("directory", nargs="?", default=".")
+    fe.add_argument("-r", "--recursive", action="store_true")
+    fe.add_argument("--sample-rate", type=float, default=1.0, help="Frames per second to sample (default 1.0)")
+    fe.add_argument("--min-face-area", type=int, default=1600, help="Minimum face box area (pixels) (default 1600)")
+    fe.add_argument("--blur-threshold", type=float, default=30.0, help="Reject faces from frames with very low sharpness (variance threshold)")
+    fe.add_argument("--max-gap", type=float, default=0.75, help="Max seconds gap to continue a track (default 0.75)")
+    fe.add_argument("--min-track-frames", type=int, default=3, help="Minimum frames for a track to be kept (default 3)")
+    fe.add_argument("--match-distance", type=float, default=0.55, help="Embedding L2 distance to merge into existing track (default 0.55)")
+    fe.add_argument("--cluster-eps", type=float, default=0.40, help="DBSCAN eps for merging split tracks (default 0.40)")
+    fe.add_argument("--cluster-min-samples", type=int, default=1, help="DBSCAN min_samples (default 1)")
+    fe.add_argument("--thumbnails", action="store_true", help="Write exemplar face thumbnails per signature")
+    fe.add_argument("--output-format", choices=["json","text"], default="json")
+    fe.add_argument("--force", action="store_true", help="Force regeneration (currently no per-video cache file)")
+
+    fi = sub.add_parser("listing", help="Aggregate distinct face signatures across videos into a global index (people listing)")
+    fi.add_argument("directory", nargs="?", default=".")
+    fi.add_argument("-r", "--recursive", action="store_true")
+    fi.add_argument("--sample-rate", type=float, default=1.0)
+    fi.add_argument("--cluster-eps", type=float, default=0.45)
+    fi.add_argument("--cluster-min-samples", type=int, default=1)
+    fi.add_argument("--output", default=None, help="Write index JSON to file (otherwise stdout)")
+    fi.add_argument("--output-format", choices=["json","text"], default="json")
+    fi.add_argument("--gallery", default=None, help="Optional labeled people directory to auto-tag clusters (subdirs=person names, images/videos inside)")
+    fi.add_argument("--gallery-sample-rate", type=float, default=1.0, help="Video sampling rate (fps) when scanning gallery videos")
+    fi.add_argument("--label-threshold", type=float, default=0.40, help="Max L2 distance to assign a label (default 0.40)")
+
+    hm = sub.add_parser("heatmaps", help="Generate brightness/motion heatmaps timeline JSON (and optional PNG)")
     hm.add_argument("directory", nargs="?", default=".")
     hm.add_argument("-r", "--recursive", action="store_true")
     hm.add_argument("--interval", type=float, default=5.0, help="Seconds between samples (default 5.0)")
@@ -1452,6 +2013,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     hm.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
     hm.add_argument("--force", action="store_true")
     hm.add_argument("--output-format", choices=["json","text"], default="json")
+    hm.add_argument("--verbose", action="store_true", help="Print per-video diagnostic details (durations, sample counts, skips, errors)")
+
+    orp = sub.add_parser("orphans", help="List (and optionally delete) orphaned artifact files whose parent video is missing")
+    orp.add_argument("directory", nargs="?", default=".")
+    orp.add_argument("-r", "--recursive", action="store_true")
+    orp.add_argument("--delete", action="store_true", help="Delete orphan artifact files")
+    orp.add_argument("--prune-empty", action="store_true", help="After deletion, remove empty .artifacts directories")
+    orp.add_argument("--output-format", choices=["text","json"], default="text")
 
     sc = sub.add_parser("scenes", help="Detect scene boundaries and generate markers (optional thumbs/clips)")
     sc.add_argument("directory", nargs="?", default=".")
@@ -1461,39 +2030,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sc.add_argument("--thumbs", action="store_true", help="Generate thumbnail per scene")
     sc.add_argument("--clips", action="store_true", help="Generate short clip per scene start")
     sc.add_argument("--clip-duration", type=float, default=2.0, help="Seconds per scene clip (default 2.0)")
-    sc.add_argument("--thumb-width", type=int, default=320, help="Thumbnail width (default 320)")
+    sc.add_argument("--thumbs-width", type=int, default=320, help="Thumbnail width (default 320)")
     sc.add_argument("--workers", type=int, default=2, help="Parallel videos (cap 4)")
     sc.add_argument("--force", action="store_true")
     sc.add_argument("--output-format", choices=["json","text"], default="json")
 
     # (Removed earlier simple 'faces' detector parser to avoid duplicate name conflict.)
 
-    ab = sub.add_parser("actor-build", help="Build face embedding gallery")
-    ab.add_argument("--people-dir", required=True)
-    ab.add_argument("--model", default="ArcFace")
-    ab.add_argument("--detector", default="retinaface")
-    ab.add_argument("--embeddings", default="gallery.npy")
-    ab.add_argument("--labels", default="labels.json")
-    ab.add_argument("--include-video", action="store_true")
-    ab.add_argument("--video-sample-rate", type=float, default=1.0)
-    ab.add_argument("--min-face-area", type=int, default=4096)
-    ab.add_argument("--blur-threshold", type=float, default=60.0)
-    ab.add_argument("--verbose", action="store_true")
-
-    am = sub.add_parser("actor-match", help="Match faces in a video")
-    am.add_argument("--video", required=True)
-    am.add_argument("--embeddings", default="gallery.npy")
-    am.add_argument("--labels", default="labels.json")
-    am.add_argument("--model", default="ArcFace")
-    am.add_argument("--detector", default="retinaface")
-    am.add_argument("--retry-detectors", default="mtcnn,opencv")
-    am.add_argument("--sample-rate", type=float, default=1.0)
-    am.add_argument("--topk", type=int, default=3)
-    am.add_argument("--conf", type=float, default=0.40)
-    am.add_argument("--min-face-area", type=int, default=4096)
-    am.add_argument("--blur-threshold", type=float, default=60.0)
-    am.add_argument("--out", default=None)
-    am.add_argument("--verbose", action="store_true")
 
     cd = sub.add_parser("codecs", help="Scan library for codec/profile compatibility")
     cd.add_argument("directory", nargs="?", default=".")
@@ -1518,7 +2061,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     tc.add_argument("--a-bitrate", default="128k")
     tc.add_argument("--preset", default="medium")
     tc.add_argument("--hardware", choices=["none","videotoolbox"], default="none")
-    tc.add_argument("--drop-subs", action="store_true", help="Exclude subtitle streams")
+    tc.add_argument("--drop-subtitles", action="store_true", help="Exclude subtitle streams")
     tc.add_argument("--workers", type=int, default=1)
     tc.add_argument("--force", action="store_true", help="Force transcode even if compatible")
     tc.add_argument("--dry-run", action="store_true")
@@ -1541,14 +2084,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     fn.add_argument("-r", "--recursive", action="store_true")
     fn.add_argument("--workers", type=int, default=2)
 
-    fc = sub.add_parser("faces", help="Detect and cluster faces across videos")
-    fc.add_argument("directory", nargs="?", default=".")
-    fc.add_argument("-r", "--recursive", action="store_true")
-    fc.add_argument("--frame-rate", type=float, default=1.0, help="Frames per second to sample")
-    fc.add_argument("--eps", type=float, default=0.5, help="DBSCAN eps parameter")
-    fc.add_argument("--min-samples", type=int, default=2, help="DBSCAN min samples")
-    fc.add_argument("--output", default=None, help="Write JSON result to file")
-    fc.add_argument("--output-format", choices=["json","text"], default="json", help="Output style (currently json for tests)")
+    # Deprecated face-related commands removed in favor of embed / listing.
 
     rn = sub.add_parser("rename", help="Rename a video and associated artifacts")
     rn.add_argument("src")
@@ -1583,8 +2119,8 @@ def cmd_list(ns) -> int:
     return 0
 
 
-def cmd_heatmap(ns) -> int:
-    """Compute brightness & motion heatmap timeline (JSON, optional PNG)."""
+def cmd_heatmaps(ns) -> int:
+    """Compute brightness & motion heatmaps timeline (JSON, optional PNG)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -1594,53 +2130,186 @@ def cmd_heatmap(ns) -> int:
         print("No MP4 files found.")
         return 0
     worker_count = max(1, min(ns.workers, 4))
-    q: Queue[Path] = Queue()
-    for v in videos:
-        q.put(v)
-    done = 0
     total = len(videos)
+    existing = 0
+    q: Queue[Path] = Queue()
+    missing_list: list[str] = []
+    for v in videos:
+        exists = heatmaps_json_path(v).exists()
+        if (not ns.force) and exists:
+            existing += 1
+            if ns.verbose:
+                print(f"heatmaps skip existing {v.name}", file=sys.stderr)
+        else:
+            missing_list.append(v.name)
+        q.put(v)
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"heatmaps: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        return 0
+    print(f"heatmaps: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
+    if ns.verbose and missing_list:
+        preview = ", ".join(missing_list[:8]) + (" ..." if len(missing_list) > 8 else "")
+        print(f"heatmaps missing targets ({len(missing_list)}): {preview}", file=sys.stderr)
+    done = 0
+    generated = 0
     lock = threading.Lock()
     errors: list[str] = []
     results: list[tuple[str, dict]] = []
 
     def worker():
-        nonlocal done
+        nonlocal done, generated
         while True:
             try:
                 vid = q.get_nowait()
             except Empty:
                 return
             try:
-                data = compute_heatmap(vid, ns.interval, ns.mode, ns.force, ns.png)
+                prev_exists = heatmaps_json_path(vid).exists()
+                if ns.verbose:
+                    # Pre-compute planned samples count using duration probe (best-effort)
+                    dur_probe = extract_duration_from_file(vid) or 0
+                    est_samples = 0
+                    if dur_probe > 0 and ns.interval > 0:
+                        est_samples = int(max(1, math.ceil(dur_probe / ns.interval)))
+                    print(f"heatmaps start {vid.name} dur~{dur_probe:.2f}s interval={ns.interval}s est_samples~{est_samples}", file=sys.stderr)
+                data = compute_heatmaps(vid, ns.interval, ns.mode, ns.force, ns.png)
+                if ns.verbose:
+                    print(f"heatmaps done  {vid.name} samples={len(data.get('samples', []))}", file=sys.stderr)
+                if not isinstance(data, dict) or "samples" not in data:
+                    raise RuntimeError("heatmaps: unexpected data structure")
                 with lock:
                     results.append((vid.name, data))
+                    if (not prev_exists) or ns.force:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total: covered = total
+                        print(f"heatmaps gen {covered}/{total} {vid.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
-                    errors.append(f"{vid.name}: {e}")
+                    err_msg = f"{vid.name}: {e}"
+                    errors.append(err_msg)
+                    if ns.verbose:
+                        print(f"heatmaps error {err_msg}", file=sys.stderr)
             finally:
                 with lock:
                     done += 1
-                    print(f"heatmap {done}/{total}\r", end="", file=sys.stderr)
                 q.task_done()
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(worker_count)]
     for t in threads:
         t.start()
+    # Periodic scan progress (mirrors thumbs/phash style)
+    while any(t.is_alive() for t in threads):
+        with lock:
+            covered = existing + generated if not ns.force else generated
+            if covered > total: covered = total
+            print(f"heatmaps scan {covered}/{total} (generated {generated})\r", end="", file=sys.stderr)
+        time.sleep(0.25)
     for t in threads:
         t.join()
-    print(f"heatmap {done}/{total}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total: covered = total
+    print(f"heatmaps scan {covered}/{total} (generated {generated})", file=sys.stderr)
+    if ns.verbose:
+        # Summary of any failures
+        if errors:
+            print(f"heatmaps failures: {len(errors)} (see above)", file=sys.stderr)
+        produced = existing + generated if not ns.force else generated
+        if produced < total and not errors:
+            # Identify residual missing
+            residual = [v.name for v in videos if not heatmaps_json_path(v).exists()]
+            if residual:
+                preview_r = ", ".join(residual[:8]) + (" ..." if len(residual) > 8 else "")
+                print(f"heatmaps still missing {len(residual)}: {preview_r}", file=sys.stderr)
     if errors:
         for e in errors:
             print("Error:", e, file=sys.stderr)
     if ns.output_format == "json":
         print(json.dumps({"results": [
-            {"video": v, "heatmap": {k: val for k, val in d.items() if k != "samples"}, "samples": d.get("samples")}
+            {"video": v, "heatmaps": {k: val for k, val in d.items() if k != "samples"}, "samples": d.get("samples")}
             for v, d in results
         ]}, indent=2))
     else:
         for v, d in results:
             print(v, len(d.get("samples", [])))
     return 1 if errors else 0
+
+
+def cmd_orphans(ns) -> int:
+    """List (and optionally delete) orphan artifact files.
+
+    An artifact is considered orphaned if it's inside a .artifacts directory whose parent
+    directory does not contain a corresponding MP4 whose stem is a prefix match of the
+    artifact filename (exact stem plus '.').
+    """
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    artifact_dirs: list[Path] = []
+    if ns.recursive:
+        for p in root.rglob(ARTIFACTS_DIR):
+            if p.is_dir():
+                artifact_dirs.append(p)
+    else:
+        d = root / ARTIFACTS_DIR
+        if d.is_dir():
+            artifact_dirs.append(d)
+    orphans: list[Path] = []
+    scanned = 0
+    ignore_names = {".DS_Store"}
+    for ad in artifact_dirs:
+        parent = ad.parent
+        video_stems = {v.stem for v in parent.iterdir() if v.is_file() and v.suffix.lower() in fMEDIA_EXTS}
+        for f in ad.iterdir():
+            if f.is_dir():
+                continue
+            if f.name in ignore_names:
+                continue
+            scanned += 1
+            # An artifact file is linked to a video if its filename begins with '<stem>.' EXACTLY (not partial word fragments)
+            stem_part = f.name.split('.', 1)[0]
+            if stem_part in video_stems:
+                continue
+            orphans.append(f)
+    deleted = 0
+    if ns.delete:
+        for f in orphans:
+            try:
+                f.unlink()
+                deleted += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"Failed to delete {f}: {e}", file=sys.stderr)
+        if ns.prune_empty:
+            # Remove any now-empty artifact dirs
+            for ad in artifact_dirs:
+                try:
+                    if any(ad.iterdir()):
+                        continue
+                    ad.rmdir()
+                except Exception:
+                    pass
+    if ns.output_format == "json":
+        print(json.dumps({
+            "root": str(root),
+            "scanned_artifact_files": scanned,
+            "orphans_found": len(orphans),
+            "deleted": deleted,
+            "files": [str(p) for p in orphans],
+        }, indent=2))
+    else:
+        if not orphans:
+            print("No orphan artifacts found")
+        else:
+            print(f"Orphan artifacts ({len(orphans)}):")
+            for p in orphans:
+                print(p)
+            if ns.delete:
+                print(f"Deleted: {deleted}")
+    return 0
 
 
 def cmd_scenes(ns) -> int:
@@ -1654,26 +2323,42 @@ def cmd_scenes(ns) -> int:
         print("No MP4 files found.")
         return 0
     worker_count = max(1, min(ns.workers, 4))
+    total = len(videos)
+    existing = 0
     q: Queue[Path] = Queue()
     for v in videos:
+        if (not ns.force) and scenes_json_path(v).exists():
+            existing += 1
         q.put(v)
+    remaining = total - existing if not ns.force else total
+    pct_existing = (existing / total * 100.0) if total else 0.0
+    if remaining == 0:
+        print(f"scenes: {existing}/{total} ({pct_existing:.1f}%) already present. Nothing to do (use --force).", file=sys.stderr)
+        return 0
+    print(f"scenes: {existing}/{total} ({pct_existing:.1f}%) existing. Generating {remaining}...", file=sys.stderr)
     done = 0
-    total = len(videos)
+    generated = 0
     lock = threading.Lock()
     errors: list[str] = []
     results: list[tuple[str, dict]] = []
 
     def worker():
-        nonlocal done
+        nonlocal done, generated
         while True:
             try:
                 vid = q.get_nowait()
             except Empty:
                 return
             try:
-                data = generate_scene_artifacts(vid, ns.threshold, ns.limit, ns.thumbs, ns.clips, ns.thumb_width, ns.clip_duration, ns.force)
+                prev_exists = scenes_json_path(vid).exists()
+                data = generate_scene_artifacts(vid, ns.threshold, ns.limit, ns.thumbs, ns.clips, ns.thumbs_width, ns.clip_duration, ns.force)
                 with lock:
                     results.append((vid.name, data))
+                    if (not prev_exists) or ns.force:
+                        generated += 1
+                        covered = existing + generated if not ns.force else generated
+                        if covered > total: covered = total
+                        print(f"scenes gen {covered}/{total} {vid.name}", file=sys.stderr)
             except Exception as e:  # noqa: BLE001
                 with lock:
                     errors.append(f"{vid.name}: {e}")
@@ -1688,7 +2373,10 @@ def cmd_scenes(ns) -> int:
         t.start()
     for t in threads:
         t.join()
-    print(f"scenes {done}/{total}", file=sys.stderr)
+    with lock:
+        covered = existing + generated if not ns.force else generated
+        if covered > total: covered = total
+    print(f"scenes scan {covered}/{total} (generated {generated})", file=sys.stderr)
     if errors:
         for e in errors:
             print("Error:", e, file=sys.stderr)
@@ -1820,232 +2508,23 @@ def generate_faces(video: Path, force: bool) -> dict:
     out_json.write_text(json.dumps(data, indent=2))
     return data
 
-# ---------------------------------------------------------------------------
-# Actor recognition
-# ---------------------------------------------------------------------------
-
-def cmd_actor_build(ns) -> int:
-    """Build face embedding gallery from people directory (optionally sample videos)."""
-    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    vid_exts = {".mp4"}
-    embeddings: list[np.ndarray] = []
-    labels: list[str] = []
-    counts: dict[str, int] = {}
-    stub = os.environ.get("DEEPFACE_STUB")
-    for actor_dir in Path(ns.people_dir).iterdir():
-        if not actor_dir.is_dir():
-            continue
-        actor = actor_dir.name
-        for path in actor_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            ext = path.suffix.lower()
-            if ext in img_exts:
-                if stub:
-                    embeddings.append(np.array([1, 0, 0, 0], dtype="float32"))
-                    labels.append(actor)
-                    counts[actor] = counts.get(actor, 0) + 1
-                    continue
-                if cv2 is None:
-                    continue  # OpenCV not available, skip image processing
-                img = cv2.imread(str(path))
-                if img is None:
-                    continue
-                try:
-                    # Attempt to use DeepFace if available (lazy import to avoid heavy startup in tests)
-                    from deepface import DeepFace  # type: ignore
-                    reps = DeepFace.represent(img_path=str(path), model_name=ns.model, detector_backend=ns.detector, enforce_detection=False)
-                except Exception:  # broad: fall back to empty reps (stub)
-                    reps = []
-                faces = reps if isinstance(reps, list) else [reps]
-                for face in faces:
-                    fa = face.get("facial_area") or {}
-                    x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
-                    if w * h < ns.min_face_area:
-                        continue
-                    crop = img[y:y + h, x:x + w]
-                    if crop.size == 0:
-                        continue
-                    if cv2 is not None and cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
-                        continue
-                    embeddings.append(np.array(face["embedding"], dtype="float32"))
-                    labels.append(actor)
-                    counts[actor] = counts.get(actor, 0) + 1
-            elif ns.include_video and ext in vid_exts:
-                if stub:
-                    continue
-                if cv2 is None:
-                    continue  # OpenCV not available, skip video processing
-                cap = cv2.VideoCapture(str(path))
-                if not cap.isOpened():
-                    continue
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                duration = frame_count / fps if fps > 0 else 0
-                t = 0.0
-                while t <= duration:
-                    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    try:
-                        from deepface import DeepFace
-                        reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=ns.detector, enforce_detection=True, align=True)
-                    except Exception:
-                        reps = []
-                    faces = reps if isinstance(reps, list) else [reps]
-                    for face in faces:
-                        fa = face.get("facial_area") or {}
-                        x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
-                        if w * h < ns.min_face_area:
-                            continue
-                        crop = frame[y:y + h, x:x + w]
-                        if crop.size == 0:
-                            continue
-                        if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
-                            continue
-                        embeddings.append(np.array(face["embedding"], dtype="float32"))
-                        labels.append(actor)
-                        counts[actor] = counts.get(actor, 0) + 1
-                    t += ns.video_sample_rate
-                cap.release()
-    if not embeddings:
-        print("No embeddings built")
-        return 1
-    arr = l2norm(np.vstack(embeddings).astype("float32"))
-    np.save(ns.embeddings, arr.astype("float32"))
-    with open(ns.labels, "w") as f:
-        json.dump(labels, f)
-    if getattr(ns, "verbose", False):
-        for actor in sorted(counts):
-            print(actor, counts[actor])
-        print(f"{arr.shape[0]}x{arr.shape[1]}")
-    return 0
-
-
-def cmd_actor_match(ns) -> int:
-    """Match faces in a single video against previously built gallery."""
-    gallery = np.load(ns.embeddings).astype("float32")
-    with open(ns.labels) as f:
-        labels = json.load(f)
-    if len(gallery) != len(labels):
-        return 2
-    gallery = l2norm(gallery)
-    stub = os.environ.get("DEEPFACE_STUB")
-    if stub:
-        vec = gallery[0]
-        scores = gallery @ vec
-        k = min(ns.topk, len(scores))
-        idx = np.argsort(-scores)[:k]
-        top = [{"label": labels[i], "score": float(scores[i])} for i in idx]
-        accepted_label = labels[idx[0]] if k > 0 and scores[idx[0]] >= ns.conf else None
-        accepted_score = float(scores[idx[0]]) if k > 0 else 0.0
-        detections = [{"t": 0.0, "bbox": [0, 0, 10, 10], "embedding_cos_topk": top, "accepted_label": accepted_label, "accepted_score": accepted_score}]
-        agg = {}
-        if accepted_label is None:
-            agg["unknown"] = {"frames": 1}
-        else:
-            agg[accepted_label] = {"frames": 1, "first_t": 0.0, "last_t": 0.0}
-        out = ns.out or str(artifact_dir(Path(ns.video)) / f"{Path(ns.video).stem}.faces.json")
-        data = {"video": ns.video, "fps": 30.0, "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
-        with open(out, "w") as f:
-            json.dump(data, f)
-        if getattr(ns, "verbose", False):
-            print(1, 1, out)
-        return 0
-    if cv2 is None:
-        print("OpenCV (cv2) is not installed. Please install opencv-python.", file=sys.stderr)
-        return 1
-    cap = cv2.VideoCapture(ns.video)
-    if not cap.isOpened():
-        print("Cannot open video")
-        return 1
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    retry = [d for d in ns.retry_detectors.split(",") if d]
-    detections: list[dict] = []
-    frame_count = 0
-    faces_total = 0
-    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps > 0 else 0
-    t = 0.0
-    while t <= duration:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-        try:
-            from deepface import DeepFace  # type: ignore
-            reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=ns.detector, enforce_detection=False)
-        except Exception:
-            reps = []
-        faces = reps if isinstance(reps, list) else [reps]
-        if len(faces) == 0:
-            for det in retry:
-                try:
-                    from deepface import DeepFace  # type: ignore
-                    reps = DeepFace.represent(img_path=frame, model_name=ns.model, detector_backend=det, enforce_detection=False)
-                except Exception:
-                    reps = []
-                faces = reps if isinstance(reps, list) else [reps]
-                if len(faces) > 0:
-                    break
-        for face in faces:
-            fa = face.get("facial_area") or {}
-            x, y, w, h = fa.get("x", 0), fa.get("y", 0), fa.get("w", 0), fa.get("h", 0)
-            if w * h < ns.min_face_area:
-                continue
-            crop = frame[y:y + h, x:x + w]
-            if crop.size == 0:
-                continue
-            if cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var() < ns.blur_threshold:
-                continue
-            vec = l2norm(np.array(face["embedding"], dtype="float32")[None, :])[0]
-            scores = gallery @ vec
-            k = min(ns.topk, len(scores))
-            idx = np.argsort(-scores)[:k]
-            top = [{"label": labels[i], "score": float(scores[i])} for i in idx]
-            accepted_label = None
-            accepted_score = float(scores[idx[0]]) if k > 0 else 0.0
-            if k > 0 and accepted_score >= ns.conf:
-                accepted_label = labels[idx[0]]
-            detections.append({"t": t, "bbox": [int(x), int(y), int(x + w), int(y + h)], "embedding_cos_topk": top, "accepted_label": accepted_label, "accepted_score": accepted_score})
-            faces_total += 1
-        if getattr(ns, "verbose", False) and frame_count % 25 == 0:
-            print(frame_count, faces_total)
-        t += ns.sample_rate
-    cap.release()
-    agg: dict[str, dict] = {}
-    for d in detections:
-        l = d["accepted_label"]
-        if l is None:
-            agg.setdefault("unknown", {"frames": 0})["frames"] += 1
-        else:
-            if l not in agg:
-                agg[l] = {"frames": 0, "first_t": d["t"], "last_t": d["t"]}
-            agg[l]["frames"] += 1
-            agg[l]["last_t"] = d["t"]
-    out = ns.out or str(artifact_dir(Path(ns.video)) / f"{Path(ns.video).stem}.faces.json")
-    data = {"video": ns.video, "fps": float(fps), "sample_rate": ns.sample_rate, "model": "deepface:" + ns.model, "detector": ns.detector, "retry_detectors": ns.retry_detectors, "conf_threshold": ns.conf, "detections": detections, "aggregate": agg}
-    with open(out, "w") as f:
-        json.dump(data, f)
-    if getattr(ns, "verbose", False):
-        print(frame_count, faces_total, out)
-    return 0
+ # (Removed legacy actor recognition commands and deepface dependency.)
+ # Restored actor recognition commands (optional DeepFace-based gallery build & match)
 
 # ---------------------------------------------------------------------------
-# Heatmap generation (brightness/motion timeline)
+# Heatmaps generation (brightness/motion timeline)
 # ---------------------------------------------------------------------------
 
-def heatmap_json_path(video: Path) -> Path:
-    return artifact_dir(video) / f"{video.stem}.heatmap.json"
+def heatmaps_json_path(video: Path) -> Path:
+    return artifact_dir(video) / f"{video.stem}.heatmaps.json"
 
 
-def heatmap_png_path(video: Path) -> Path:
-    return artifact_dir(video) / f"{video.stem}.heatmap.png"
+def heatmaps_png_path(video: Path) -> Path:
+    return artifact_dir(video) / f"{video.stem}.heatmaps.png"
 
 
-def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_png: bool) -> dict:
-    out_json = heatmap_json_path(video)
+def compute_heatmaps(video: Path, interval: float, mode: str, force: bool, write_png: bool) -> dict:
+    out_json = heatmaps_json_path(video)
     if out_json.exists() and not force:
         return json.loads(out_json.read_text())
     duration = extract_duration_from_file(video) or 0
@@ -2089,7 +2568,9 @@ def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_
             pixels = list(im.getdata())
         except Exception:
             pixels = list(img_bytes[:1024])  # crude fallback
-        # brightness
+        # brightness (guard against empty pixel list -> ffmpeg decode failure produced no bytes)
+        if not pixels:
+            pixels = [0]
         avg_brightness = sum(pixels) / len(pixels)
         motion_val = 0.0
         if prev_pixels is not None and (mode in ("motion", "both")):
@@ -2097,7 +2578,8 @@ def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_
             diffs = 0
             for a, b in zip(pixels, prev_pixels):
                 diffs += abs(a - b)
-            motion_val = diffs / (len(pixels) * 255.0)
+            if pixels:
+                motion_val = diffs / (len(pixels) * 255.0)
         samples.append({
             "t": ts,
             "brightness": avg_brightness if mode in ("brightness", "both", "motion") else None,
@@ -2123,20 +2605,20 @@ def compute_heatmap(video: Path, interval: float, mode: str, force: bool, write_
                 img = Image.new("L", (w, 1))
                 img.putdata(row)
                 img = img.resize((w, 32), resample=Image.Resampling.NEAREST)
-                img.save(heatmap_png_path(video))
+                img.save(heatmaps_png_path(video))
             elif mode == "motion":
                 row = [int(min(255, max(0, (s["motion"] or 0) * 255))) for s in samples]
                 img = Image.new("L", (w, 1))
                 img.putdata(row)
                 img = img.resize((w, 32), resample=Image.Resampling.NEAREST)
-                img.save(heatmap_png_path(video))
+                img.save(heatmaps_png_path(video))
             else:  # both -> two rows stacked
                 row1 = [int(min(255, max(0, s["brightness"])) ) for s in samples]
                 row2 = [int(min(255, max(0, (s["motion"] or 0) * 255))) for s in samples]
                 img = Image.new("L", (w, 2))
                 img.putdata(row1 + row2)
                 img = img.resize((w, 64), resample=Image.Resampling.NEAREST)
-                img.save(heatmap_png_path(video))
+                img.save(heatmaps_png_path(video))
         except Exception:
             pass
     return data
@@ -2182,7 +2664,7 @@ def detect_scenes(video: Path, threshold: float) -> list[tuple[float, float]]:
         return [(1.0, 1.0)]
 
 
-def generate_scene_artifacts(video: Path, threshold: float, limit: int, gen_thumbs: bool, gen_clips: bool, thumb_width: int, clip_duration: float, force: bool) -> dict:
+def generate_scene_artifacts(video: Path, threshold: float, limit: int, gen_thumbs: bool, gen_clips: bool, thumbs_width: int, clip_duration: float, force: bool) -> dict:
     out_json = scenes_json_path(video)
     if out_json.exists() and not force:
         return json.loads(out_json.read_text())
@@ -2198,18 +2680,18 @@ def generate_scene_artifacts(video: Path, threshold: float, limit: int, gen_thum
         entry: dict = {"time": t, "score": score}
         safe_t = max(0.0, min(t, max(0.0, duration - 0.01)))
         if gen_thumbs:
-            thumb_file = asset_dir / f"scene_{idx:03d}.jpg"
-            if (not thumb_file.exists()) or force:
+            thumbs_file = asset_dir / f"scene_{idx:03d}.jpg"
+            if (not thumbs_file.exists()) or force:
                 if os.environ.get("FFPROBE_DISABLE") or not ffmpeg_available():
-                    thumb_file.write_text(f"stub thumb {safe_t}")
+                    thumbs_file.write_text(f"stub thumbs {safe_t}")
                 else:
                     cmd = [
                         "ffmpeg", "-v", "error", "-ss", f"{safe_t:.3f}", "-i", str(video), "-frames:v", "1",
-                        "-vf", f"scale={thumb_width}:-1:force_original_aspect_ratio=decrease",
-                        "-qscale:v", "4", str(thumb_file)
+                        "-vf", f"scale={thumbs_width}:-1:force_original_aspect_ratio=decrease",
+                        "-qscale:v", "4", str(thumbs_file)
                     ]
                     subprocess.run(cmd, capture_output=True)
-            entry["thumb"] = thumb_file.name
+            entry["thumbs"] = thumbs_file.name
         if gen_clips:
             clip_file = asset_dir / f"scene_{idx:03d}.mp4"
             if (not clip_file.exists()) or force:
@@ -2289,7 +2771,7 @@ def codec_is_compatible(info: dict, target_v: str, target_a: str, profiles: set[
     return (len(reasons) == 0, reasons)
 
 
-def build_transcode_cmd(src: Path, dst: Path, target_v: str, target_a: str, crf: int, v_bitrate: str | None, a_bitrate: str, preset: str, hw: str, drop_subs: bool) -> list[str]:
+def build_transcode_cmd(src: Path, dst: Path, target_v: str, target_a: str, crf: int, v_bitrate: str | None, a_bitrate: str, preset: str, hw: str, drop_subtitles: bool) -> list[str]:
     # Decide video encoder
     if hw == "videotoolbox" and target_v == "h264":
         vencoder = "h264_videotoolbox"
@@ -2311,7 +2793,7 @@ def build_transcode_cmd(src: Path, dst: Path, target_v: str, target_a: str, crf:
         aencoder = {"aac": "aac", "opus": "libopus"}.get(target_a, "aac")
         a_part = ["-c:a", aencoder, "-b:a", a_bitrate]
     map_part: list[str] = []
-    if drop_subs:
+    if drop_subtitles:
         map_part = ["-map", "0", "-map", "-0:s"]
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src)] + map_part + v_part + a_part + ["-movflags", "+faststart", str(dst)]
     return cmd
@@ -2422,12 +2904,12 @@ def cmd_transcode(ns) -> int:
                     if dry:
                         action = {"video": str(v), "status": "plan-transcode", "reasons": reasons, "output": str(out_file)}
                     else:
-                        cmd = build_transcode_cmd(v, out_file, ns.target_v, ns.target_a, ns.crf, ns.v_bitrate, ns.a_bitrate, ns.preset, ns.hardware, ns.drop_subs)
+                        cmd = build_transcode_cmd(v, out_file, ns.target_v, ns.target_a, ns.crf, ns.v_bitrate, ns.a_bitrate, ns.preset, ns.hardware, ns.drop_subtitles)
                         start = time.time()
                         if ns.progress:
                             # Use -progress pipe:1 for periodic key=value lines; rebuild command
                             prog_cmd = ["ffmpeg", "-v", "error", "-i", str(v)]
-                            if ns.drop_subs:
+                            if ns.drop_subtitles:
                                 prog_cmd += ["-map", "0", "-map", "-0:s"]
                             # replicate encoding settings roughly
                             # Simplify: rely on previously built cmd parts excluding initial ffmpeg -y -v error -i and output
@@ -2564,41 +3046,10 @@ def cmd_compare(ns) -> int:
     return 0
 
 
-def cmd_faces(ns) -> int:
-    """Cluster faces across videos (heavy deps) or stub output when disabled."""
-    root = Path(ns.directory).expanduser().resolve()
-    if not root.is_dir():
-        print(f"Error: directory not found: {root}", file=sys.stderr)
-        return 2
-    videos = find_mp4s(root, ns.recursive)
-    clusters = cluster_faces(
-        videos,
-        frame_rate=ns.frame_rate,
-        eps=ns.eps,
-        min_samples=ns.min_samples,
-    )
-    # In stub/offline test mode (FFPROBE_DISABLE) also write a simple per-video artifact
-    stub = os.environ.get("FFPROBE_DISABLE")
-    if stub:
-        # Write an empty faces json for each video (structure aligned with other commands)
-        for v in videos:
-            out = artifact_dir(v) / f"{v.stem}.faces.json"
-            if not out.exists():
-                out.write_text(json.dumps({"detections": []}, indent=2))
-    text = json.dumps(clusters, indent=2)
-    if ns.output_format == "json":
-        if ns.output:
-            Path(ns.output).write_text(text)
-        else:
-            print(text)
-    else:
-        # simple text summary
-        for cid, occs in clusters.items():
-            print(cid, len(occs))
-    return 0
 
-def cmd_faces_per_video(ns) -> int:
-    """Detect faces in each video individually and write per-video .faces.json files."""
+
+def cmd_faces_embed(ns) -> int:
+    """Extract distinct face signatures per video (tracking + clustering + optional thumbnails)."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
@@ -2607,19 +3058,155 @@ def cmd_faces_per_video(ns) -> int:
     if not videos:
         print("No MP4 files found.")
         return 0
-    errors: list[str] = []
+    results: list[dict] = []
     for v in videos:
         try:
-            generate_faces(v, force=getattr(ns, "force", False))
-            print(f"Faces detected for {v.name}")
-        except Exception as e:
-            errors.append(f"{v}: {e}")
-    if errors:
-        print("Errors (some faces missing):", file=sys.stderr)
-        for e in errors:
-            print("  " + e, file=sys.stderr)
-    print(f"Faces detection done for {len(videos) - len(errors)} file(s)")
-    return 0 if not errors else 1
+            sigs = extract_distinct_face_signatures(
+                v,
+                sample_rate=ns.sample_rate,
+                min_face_area=ns.min_face_area,
+                blur_threshold=ns.blur_threshold,
+                max_gap=ns.max_gap,
+                min_track_frames=ns.min_track_frames,
+                match_distance=ns.match_distance,
+                cluster_eps=ns.cluster_eps,
+                cluster_min_samples=ns.cluster_min_samples,
+            )
+            if ns.thumbnails and sigs and cv2 is not None:
+                try:
+                    cap = cv2.VideoCapture(str(v))
+                    for sig in sigs:
+                        mid_t = (sig["start_t"] + sig["end_t"]) / 2.0
+                        cap.set(cv2.CAP_PROP_POS_MSEC, mid_t * 1000)
+                        ret, frame = cap.read()
+                        if not ret:
+                            continue
+                        out_path = artifact_dir(v) / f"{v.stem}.face_{sig['id']}.jpg"
+                        try: cv2.imwrite(str(out_path), frame)
+                        except Exception: pass
+                    cap.release()
+                except Exception:
+                    pass
+            # Persist per-video signatures artifact
+            try:
+                sig_path = artifact_dir(v) / f"{v.stem}.faces.signatures.json"
+                sig_payload = {"video": v.name, "count": len(sigs), "signatures": sigs, "generated_at": time.time()}
+                sig_path.write_text(json.dumps(sig_payload, indent=2))
+            except Exception:
+                pass
+            results.append({"video": v.name, "count": len(sigs), "signatures": sigs})
+        except Exception as e:  # noqa: BLE001
+            results.append({"video": v.name, "error": str(e)})
+    if ns.output_format == "json":
+        print(json.dumps({"results": results}, indent=2))
+    else:
+        for r in results:
+            if "error" in r:
+                print(f"{r['video']}: ERROR {r['error']}")
+            else:
+                print(f"{r['video']}: {r['count']} signatures")
+    return 0
+
+
+def cmd_faces_index(ns):
+    """Build a global face index across videos (deduplicated people list).
+
+    Returns the index dict (people, videos, etc.) instead of exit code for easier reuse by API.
+    """
+    root = Path(ns.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: directory not found: {root}", file=sys.stderr)
+        return 2
+    index = build_face_index(
+        root,
+        recursive=ns.recursive,
+        sample_rate=ns.sample_rate,
+        cluster_eps=ns.cluster_eps,
+        cluster_min_samples=ns.cluster_min_samples,
+    )
+    # Optional supervised labeling via gallery directory
+    if getattr(ns, "gallery", None):
+        gal_root = Path(ns.gallery).expanduser().resolve()
+        if gal_root.is_dir():
+            gallery_embs: list[np.ndarray] = []
+            gallery_labels: list[str] = []
+            img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+            vid_exts = {".mp4"}
+            try:
+                import face_recognition  # type: ignore
+                import cv2  # type: ignore
+            except Exception:
+                face_recognition = None  # type: ignore
+                cv2 = None  # type: ignore
+            for person_dir in gal_root.iterdir():
+                if not person_dir.is_dir():
+                    continue
+                label = person_dir.name
+                for p in person_dir.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    ext = p.suffix.lower()
+                    if ext in img_exts and face_recognition is not None:
+                        try:
+                            import PIL.Image  # type: ignore
+                            img = np.array(PIL.Image.open(p).convert("RGB"))
+                            boxes = face_recognition.face_locations(img)
+                            if not boxes:
+                                continue
+                            encs = face_recognition.face_encodings(img, boxes)
+                            for enc in encs:
+                                gallery_embs.append(enc.astype("float32"))
+                                gallery_labels.append(label)
+                        except Exception:
+                            pass
+                    elif ext in vid_exts and face_recognition is not None and cv2 is not None:
+                        cap = cv2.VideoCapture(str(p))
+                        if not cap.isOpened():
+                            continue
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        step = max(int(round(fps / max(ns.gallery_sample_rate, 0.1))), 1)
+                        fidx = 0
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            if fidx % step == 0:
+                                rgb = frame[:, :, ::-1]
+                                try:
+                                    boxes = face_recognition.face_locations(rgb)
+                                    if boxes:
+                                        encs = face_recognition.face_encodings(rgb, boxes)
+                                        for enc in encs:
+                                            gallery_embs.append(enc.astype("float32"))
+                                            gallery_labels.append(label)
+                                except Exception:
+                                    pass
+                            fidx += 1
+                        cap.release()
+            if gallery_embs:
+                gal_arr = np.vstack(gallery_embs).astype("float32")
+                gal_arr_norm = gal_arr / (np.linalg.norm(gal_arr, axis=1, keepdims=True) + 1e-12)
+                for person in index.get("people", []):
+                    emb = np.array(person.get("embedding", []), dtype="float32")
+                    if emb.size == 0:
+                        continue
+                    emb = emb / (np.linalg.norm(emb) or 1.0)
+                    dists = np.linalg.norm(gal_arr_norm - emb[None, :], axis=1)
+                    j = int(np.argmin(dists))
+                    if dists[j] <= ns.label_threshold:
+                        person["label"] = gallery_labels[j]
+                        person["label_distance"] = float(dists[j])
+    if ns.output_format == "json":
+        text = json.dumps(index, indent=2)
+        if getattr(ns, "output", None):
+            Path(ns.output).write_text(text)
+        else:
+            print(text)
+    else:
+        print(f"people={len(index.get('people', []))} videos={index.get('videos')}")
+        for person in index.get("people", [])[:20]:
+            print(person["id"], len(person.get("occurrences", [])))
+    return index
 
 
 def cmd_report(ns) -> int:
@@ -2632,50 +3219,68 @@ def cmd_report(ns) -> int:
     videos.sort()
     total = len(videos)
     if total == 0:
-        print("No MP4 files found.")
-        return 0
+        # Attempt auto-recursive discovery if user omitted -r
+        if not ns.recursive:
+            # Quick probe: first few matches of mp4 or artifact signature
+            found_any = False
+            probe_limit = 25
+            mp4s = []
+            for i, p in enumerate(root.rglob('*.mp4')):
+                mp4s.append(p)
+                if i >= probe_limit:
+                    break
+            if mp4s:
+                print("[report] Auto-enabling recursive scan (videos found in subdirectories)", file=sys.stderr)
+                ns.recursive = True
+                videos = find_mp4s(root, True)
+                videos.sort()
+                total = len(videos)
+        # If still zero, short-circuit
+        if total == 0:
+            print("No MP4 files found.")
+            return 0
     # Artifact detectors
     counts = {
         "metadata": 0,
-        "thumb": 0,
+        "thumbs": 0,
         "sprites": 0,
         "previews": 0,
-        "subs": 0,
+        "subtitles": 0,
         "phash": 0,
-        "heatmap": 0,
+        "heatmaps": 0,
         "scenes": 0,
         "faces": 0,
     }
     rows: list[dict] = []
     for v in videos:
-        meta_ok = metadata_path(v).exists()
-        thumb_ok = thumb_path(v).exists()
+        metadata_ok = metadata_path(v).exists()
+        thumb_ok = thumbs_path(v).exists()
         s, j = sprite_sheet_paths(v)
         sprites_ok = s.exists() and j.exists()
         previews_ok = preview_index_path(v).exists()
-        subs_ok = find_subtitles(v) is not None
+        subtitles_ok = find_subtitles(v) is not None
         phash_ok = phash_path(v).exists()
-        heatmap_ok = heatmap_json_path(v).exists()
+        heatmap_ok = heatmaps_json_path(v).exists()
         scenes_ok = scenes_json_path(v).exists()
         faces_ok = faces_json_path(v).exists()
-        if meta_ok: counts["metadata"] += 1
-        if thumb_ok: counts["thumb"] += 1
+        if metadata_ok: counts["metadata"] += 1
+        if thumb_ok: counts["thumbs"] += 1
         if sprites_ok: counts["sprites"] += 1
         if previews_ok: counts["previews"] += 1
-        if subs_ok: counts["subs"] += 1
+        if subtitles_ok: counts["subtitles"] += 1
         if phash_ok: counts["phash"] += 1
-        if heatmap_ok: counts["heatmap"] += 1
+        if heatmap_ok: counts["heatmaps"] += 1
         if scenes_ok: counts["scenes"] += 1
         if faces_ok: counts["faces"] += 1
         rows.append({
             "video": v.name,
-            "metadata": meta_ok,
-            "thumb": thumb_ok,
+            "metadata": metadata_ok,
+            "thumbs": thumb_ok,
             "sprites": sprites_ok,
             "previews": previews_ok,
-            "subs": subs_ok,
+            "subtitles": subtitles_ok,
             "phash": phash_ok,
-            "heatmap": heatmap_ok,
+            "heatmaps": heatmap_ok,
             "scenes": scenes_ok,
             "faces": faces_ok,
         })
@@ -2700,6 +3305,34 @@ def cmd_rename(ns) -> int:
     return 0
 
 
+def generate_report(root: Path, recursive: bool) -> dict:
+    """Generate artifact coverage report for videos in a directory."""
+    videos = find_mp4s(root, recursive)
+    total = len(videos)
+    counts = {
+        "metadata": 0,
+        "thumbs": 0,
+        "sprites": 0,
+        "previews": 0,
+        "subtitles": 0,
+        "phash": 0,
+        "heatmaps": 0,
+        "scenes": 0,
+        "faces": 0,
+    }
+    for v in videos:
+        if metadata_path(v).exists(): counts["metadata"] += 1
+        if thumbs_path(v).exists(): counts["thumbs"] += 1
+        s, j = sprite_sheet_paths(v)
+        if s.exists() and j.exists(): counts["sprites"] += 1
+        if preview_index_path(v).exists(): counts["previews"] += 1
+        if find_subtitles(v) is not None: counts["subtitles"] += 1
+        if phash_path(v).exists(): counts["phash"] += 1
+        if heatmaps_json_path(v).exists(): counts["heatmaps"] += 1
+        if scenes_json_path(v).exists(): counts["scenes"] += 1
+        if faces_json_path(v).exists(): counts["faces"] += 1
+    return {"total": total, "counts": counts}
+
 def cmd_finish(ns) -> int:
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2709,13 +3342,13 @@ def cmd_finish(ns) -> int:
     total = rep.get("total", 0)
     counts = rep.get("counts", {})
     mapping = [
-        ("metadata", "meta"),
-        ("thumb", "thumb"),
+        ("metadata", "metadata"),
+        ("thumbs", "thumbs"),
         ("sprites", "sprites"),
         ("previews", "previews"),
-        ("subs", "subs"),
+        ("subtitles", "subtitles"),
         ("phash", "phash"),
-        ("heatmap", "heatmap"),
+        ("heatmaps", "heatmaps"),
         ("scenes", "scenes"),
         ("faces", "faces"),
     ]
@@ -2728,10 +3361,10 @@ def cmd_finish(ns) -> int:
         recursive=ns.recursive,
         tasks=",".join(tasks),
         max_meta=ns.workers,
-        max_thumb=ns.workers,
+        max_thumbs=ns.workers,
         max_sprites=ns.workers,
         max_previews=ns.workers,
-        max_subs=1,
+        max_subtitles=1,
         max_phash=ns.workers,
         max_scenes=1,
         preview_width=320,
@@ -2741,17 +3374,17 @@ def cmd_finish(ns) -> int:
         sprites_width=320,
         sprites_cols=10,
         sprites_rows=10,
-        subs_model="small",
-        subs_backend="auto",
-        subs_format="srt",
-        subs_language=None,
-        subs_translate=False,
+        subtitles_model="small",
+        subtitles_backend="auto",
+        subtitles_format="srt",
+        subtitles_language=None,
+        subtitles_translate=False,
         force=False,
     )
     return cmd_batch(ns_batch)
+    # The generate_report function is similar to the logic in cmd_report, but is used internally for the "finish" command to compute which artifact tasks are incomplete. It is not strictly necessary if you refactor cmd_report to return its summary instead of printing, but currently both exist for separation of CLI output and internal logic.
 
-
-def cmd_meta(ns) -> int:
+def cmd_metadata(ns) -> int:
     """Generate ffprobe metadata JSON sidecars for each video."""
     root = Path(ns.directory).expanduser().resolve()
     if not root.is_dir():
@@ -2780,50 +3413,47 @@ def resolve_directory(ns):
     return ns
 
 def main(argv: List[str] | None = None) -> int:
-    ns = parse_args(argv or sys.argv[1:])
+    raw_args = argv or sys.argv[1:]
+    ns = parse_args(raw_args)
+    # Fallback: user supplied directory then command (e.g. './index.py /path orphans')
+    command_names = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish"}
+    if ns.cmd not in command_names and raw_args:
+        first = raw_args[0]
+        if Path(first).exists() and len(raw_args) > 1 and raw_args[1] in command_names:
+            # Reinterpret as path-first; rebuild argv swapping first two
+            reordered = [raw_args[1], first] + raw_args[2:]
+            ns = parse_args(reordered)
+            ns = resolve_directory(ns)
+            print(f"(note) path-first invocation detected; treating '{first}' as directory and '{raw_args[1]}' as command. Preferred usage: {Path(sys.argv[0]).name} {raw_args[1]} {first}", file=sys.stderr)
     ns = resolve_directory(ns)
-    if ns.cmd == "list":
-        return cmd_list(ns)
-    if ns.cmd == "report":
-        return cmd_report(ns)
-    if ns.cmd == "meta":
-        return cmd_meta(ns)
-    if ns.cmd == "thumb":
-        return cmd_thumb(ns)
-    if ns.cmd == "sprites":
-        return cmd_sprites(ns)
-    if ns.cmd == "previews":
-        return cmd_previews(ns)
-    if ns.cmd == "subs":
-        return cmd_subs(ns)
-    if ns.cmd == "phash":
-        return cmd_phash(ns)
-    if ns.cmd == "heatmap":
-        return cmd_heatmap(ns)
-    if ns.cmd == "scenes":
-        return cmd_scenes(ns)
-    if ns.cmd == "faces":
-        return cmd_faces_per_video(ns)
-    if ns.cmd == "rename":
-        return cmd_rename(ns)
-    if ns.cmd == "actor-build":
-        return cmd_actor_build(ns)
-    if ns.cmd == "actor-match":
-        return cmd_actor_match(ns)
-    if ns.cmd == "codecs":
-        return cmd_codecs(ns)
-    if ns.cmd == "transcode":
-        return cmd_transcode(ns)
-    if ns.cmd == "compare":
-        return cmd_compare(ns)
-    if ns.cmd == "batch":
-        return cmd_batch(ns)
-    if ns.cmd == "finish":
-        return cmd_finish(ns)
+
+    if ns.cmd == "list": return cmd_list(ns)
+    if ns.cmd == "report": return cmd_report(ns)
+    if ns.cmd == "orphans": return cmd_orphans(ns)
+    if ns.cmd == "batch": return cmd_batch(ns)
+    if ns.cmd == "finish": return cmd_finish(ns)
+    if ns.cmd == "rename": return cmd_rename(ns)
+
+    if ns.cmd == "metadata": return cmd_metadata(ns)
+    if ns.cmd == "thumbs": return cmd_thumbs(ns)
+    if ns.cmd == "sprites": return cmd_sprites(ns)
+    if ns.cmd == "previews": return cmd_previews(ns)
+    if ns.cmd == "subtitles": return cmd_subtitles(ns)
+    if ns.cmd == "heatmaps": return cmd_heatmaps(ns)
+    if ns.cmd == "scenes": return cmd_scenes(ns)
+    if ns.cmd == "phash": return cmd_phash(ns)
+    if ns.cmd == "dupes": return cmd_phash_dupes(ns)
+    if ns.cmd == "codecs": return cmd_codecs(ns)
+    if ns.cmd == "transcode": return cmd_transcode(ns)
+    if ns.cmd == "compare": return cmd_compare(ns)
+    
+    if ns.cmd == "embed": return cmd_faces_embed(ns)
+    if ns.cmd == "listing":
+        cmd_faces_index(ns)  # returns dict; CLI expects exit code so ignore value
+        return 0
 
     print("Unknown command", file=sys.stderr)
     return 1
-
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

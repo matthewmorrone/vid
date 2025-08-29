@@ -8,7 +8,7 @@ Endpoints (initial):
 - GET /report : coverage summary (reuses logic similar to report subcommand)
 - GET /jobs : list submitted jobs
 - GET /jobs/{id} : single job details
-- POST /jobs : submit a job {"task": "meta|thumb|sprites|previews|subs|phash|heatmap|scenes|codecs|transcode|report", "directory": ".", ...}
+- POST /jobs : submit a job {"task": "metadata|thumbs|sprites|previews|subtitles|phash|heatmaps|scenes|codecs|transcode|report", "directory": ".", ...}
 
 Job model (in-memory, ephemeral):
 {
@@ -58,12 +58,20 @@ class JobRecord(BaseModel):
     ended_at: Optional[float] = None
     result: Optional[Any] = None
     error: Optional[str] = None
+    # Basic progress counters (optional usage by tasks)
+    progress_current: Optional[int] = None
+    progress_total: Optional[int] = None
 
 _jobs: Dict[str, JobRecord] = {}
 _jobs_lock = threading.Lock()
 
 ALLOWED_TASKS = {
-    "meta", "thumb", "sprites", "previews", "subs", "phash", "heatmap", "scenes", "faces", "actor-build", "actor-match", "codecs", "transcode", "report"
+    # Core artifact & analysis tasks
+    "metadata", "thumbs", "sprites", "previews", "subtitles", "phash", "dupes", "heatmaps", "scenes",
+    # Face pipeline (renamed / consolidated)
+    "embed", "listing",
+    # Codec / conversion & reporting
+    "codecs", "transcode", "report"
 }
 
 # ---------------------------------------------------------------------------
@@ -98,18 +106,17 @@ class JobExecutor(threading.Thread):
         force = bool(params.get("force", False))
         if task == "report":
             return generate_report(directory, recursive)
-        # Build synthetic namespace for selected commands (only minimal flags for now)
         ns = SimpleNamespace(
             directory=str(directory),
             recursive=recursive,
             force=force,
             workers=params.get("workers", 2),
         )
-        if task == "meta":
-            return index.cmd_meta(ns)
-        if task == "thumb":
+        if task == "metadata":
+            return index.cmd_metadata(ns)
+        if task == "thumbs":
             ns.time = params.get("time", "middle")
-            return index.cmd_thumb(ns)
+            return index.cmd_thumbs(ns)
         if task == "sprites":
             ns.interval = params.get("interval", 10.0)
             ns.width = params.get("width", 320)
@@ -127,7 +134,7 @@ class JobExecutor(threading.Thread):
             ns.bitrate = params.get("bitrate", "300k")
             ns.no_index = params.get("no_index", False)
             return index.cmd_previews(ns)
-        if task == "subs":
+        if task == "subtitles":
             ns.model = params.get("model", "small")
             ns.backend = params.get("backend", "auto")
             ns.language = params.get("language")
@@ -135,7 +142,7 @@ class JobExecutor(threading.Thread):
             ns.output_dir = None
             ns.whisper_cpp_bin = None
             ns.whisper_cpp_model = None
-            return index.cmd_subs(ns)
+            return index.cmd_subtitles(ns)
         if task == "phash":
             ns.time = params.get("time", "middle")
             ns.frames = params.get("frames", 5)
@@ -143,55 +150,50 @@ class JobExecutor(threading.Thread):
             ns.algo = params.get("algo", "ahash")
             ns.combine = params.get("combine", "xor")
             return index.cmd_phash(ns)
-        if task == "heatmap":
+        if task == "dupes":
+            # non-mutating analysis; direct function call
+            threshold = float(params.get("threshold", 0.90))
+            limit = int(params.get("limit", 0))
+            return index.find_phash_duplicates(directory, recursive, threshold, limit)
+        if task == "heatmaps":
             ns.interval = params.get("interval", 5.0)
             ns.mode = params.get("mode", "both")
             ns.png = params.get("png", False)
             ns.output_format = "json"
-            return index.cmd_heatmap(ns)
+            return index.cmd_heatmaps(ns)
         if task == "scenes":
             ns.threshold = params.get("threshold", 0.4)
             ns.limit = params.get("limit", 0)
             ns.thumbs = params.get("thumbs", False)
             ns.clips = params.get("clips", False)
             ns.clip_duration = params.get("clip_duration", 2.0)
-            ns.thumb_width = params.get("thumb_width", 320)
+            ns.thumbs_width = params.get("thumbs_width", 320)
             ns.output_format = "json"
             return index.cmd_scenes(ns)
-        if task == "faces":
+        if task == "embed":
+            # Per-video distinct face signature extraction
+            ns.sample_rate = params.get("sample_rate", 1.0)
+            ns.min_face_area = params.get("min_face_area", 40 * 40)
+            ns.blur_threshold = params.get("blur_threshold", 30.0)
+            ns.max_gap = params.get("max_gap", 0.75)
+            ns.min_track_frames = params.get("min_track_frames", 3)
+            ns.match_distance = params.get("match_distance", 0.55)
+            ns.cluster_eps = params.get("cluster_eps", 0.40)
+            ns.cluster_min_samples = params.get("cluster_min_samples", 1)
+            ns.thumbnails = params.get("thumbnails", False)
             ns.output_format = "json"
-            return index.cmd_faces(ns)
-        if task == "actor-build":
-            ns = SimpleNamespace(
-                people_dir=params.get("people_dir"),
-                model=params.get("model", "ArcFace"),
-                detector=params.get("detector", "retinaface"),
-                embeddings=params.get("embeddings", "gallery.npy"),
-                labels=params.get("labels", "labels.json"),
-                include_video=params.get("include_video", False),
-                video_sample_rate=params.get("video_sample_rate", 1.0),
-                min_face_area=params.get("min_face_area", 4096),
-                blur_threshold=params.get("blur_threshold", 60.0),
-                verbose=params.get("verbose", False),
-            )
-            return index.cmd_actor_build(ns)
-        if task == "actor-match":
-            ns = SimpleNamespace(
-                video=params.get("video"),
-                embeddings=params.get("embeddings", "gallery.npy"),
-                labels=params.get("labels", "labels.json"),
-                model=params.get("model", "ArcFace"),
-                detector=params.get("detector", "retinaface"),
-                retry_detectors=params.get("retry_detectors", "mtcnn,opencv"),
-                sample_rate=params.get("sample_rate", 1.0),
-                topk=params.get("topk", 3),
-                conf=params.get("conf", 0.40),
-                min_face_area=params.get("min_face_area", 4096),
-                blur_threshold=params.get("blur_threshold", 60.0),
-                out=params.get("out"),
-                verbose=params.get("verbose", False),
-            )
-            return index.cmd_actor_match(ns)
+            return index.cmd_faces_embed(ns)
+        if task == "listing":
+            # Global deduplicated face index across videos
+            ns.sample_rate = params.get("sample_rate", 1.0)
+            ns.cluster_eps = params.get("cluster_eps", 0.45)
+            ns.cluster_min_samples = params.get("cluster_min_samples", 1)
+            ns.output = params.get("output")
+            ns.output_format = params.get("output_format", "json")
+            ns.gallery = params.get("gallery")
+            ns.gallery_sample_rate = params.get("gallery_sample_rate", 1.0)
+            ns.label_threshold = params.get("label_threshold", 0.40)
+            return index.cmd_faces_index(ns)
         if task == "codecs":
             ns.target_v = params.get("target_v", "h264")
             ns.target_a = params.get("target_a", "aac")
@@ -209,7 +211,7 @@ class JobExecutor(threading.Thread):
             ns.a_bitrate = params.get("a_bitrate", "128k")
             ns.preset = params.get("preset", "medium")
             ns.hardware = params.get("hardware", "none")
-            ns.drop_subs = params.get("drop_subs", False)
+            ns.drop_subtitles = params.get("drop_subtitles", False)
             ns.force = force or params.get("force", False)
             ns.dry_run = params.get("dry_run", False)
             ns.progress = False
@@ -221,17 +223,17 @@ class JobExecutor(threading.Thread):
 def generate_report(root: Path, recursive: bool) -> dict:
     videos = index.find_mp4s(root, recursive)
     total = len(videos)
-    counts = {k: 0 for k in ("metadata","thumb","sprites","previews","subs","phash","heatmap","scenes","faces")}
+    counts = {k: 0 for k in ("metadata","thumbs","sprites","previews","subtitles","phash","heatmaps","scenes","faces")}
     for v in videos:
         if index.metadata_path(v).exists(): counts["metadata"] += 1
-        if index.thumb_path(v).exists(): counts["thumb"] += 1
+        if index.thumbs_path(v).exists(): counts["thumbs"] += 1
         s, j = index.sprite_sheet_paths(v)
         if s.exists() and j.exists(): counts["sprites"] += 1
         if index.preview_index_path(v).exists(): counts["previews"] += 1
-        if index.find_subtitles(v) is not None: counts["subs"] += 1
+        if index.find_subtitles(v) is not None: counts["subtitles"] += 1
         if index.phash_path(v).exists(): counts["phash"] += 1
         try:
-            if index.heatmap_json_path(v).exists(): counts["heatmap"] += 1
+            if index.heatmaps_json_path(v).exists(): counts["heatmaps"] += 1
         except Exception:
             pass
         try:
@@ -266,12 +268,20 @@ def health():
 
 
 @app.get("/videos")
-def list_videos(directory: str = Query("."), recursive: bool = Query(False)):
+def list_videos(directory: str = Query("."), recursive: bool = Query(False), offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000), q: Optional[str] = Query(None)):
     root = Path(directory).expanduser().resolve()
     if not root.is_dir():
         raise HTTPException(404, "directory not found")
-    vids = [str(p) for p in index.find_mp4s(root, recursive)]
-    return {"directory": str(root), "count": len(vids), "videos": vids}
+    vids_all = [p for p in index.find_mp4s(root, recursive)]
+    if q:
+        qlow = q.lower()
+        vids_all = [p for p in vids_all if qlow in p.name.lower()]
+    total = len(vids_all)
+    slice_v = vids_all[offset: offset + limit]
+    etag_base = f"{root}:{recursive}:{total}:{offset}:{limit}:{q or ''}".encode()
+    import hashlib
+    etag = hashlib.sha1(etag_base).hexdigest()
+    return {"directory": str(root), "count": total, "videos": [str(p) for p in slice_v], "offset": offset, "limit": limit, "etag": etag}
 
 
 @app.get("/videos/{name}/artifacts")
@@ -284,12 +294,12 @@ def video_artifacts(name: str, directory: str = Query(".")):
     return {
         "video": name,
         "metadata": index.metadata_path(path).exists(),
-        "thumb": index.thumb_path(path).exists(),
+    "thumbs": index.thumbs_path(path).exists(),
         "sprites": s.exists() and j.exists(),
         "previews": index.preview_index_path(path).exists(),
-        "subs": index.find_subtitles(path) is not None,
+        "subtitles": index.find_subtitles(path) is not None,
         "phash": index.phash_path(path).exists(),
-        "heatmap": hasattr(index, 'heatmap_json_path') and index.heatmap_json_path(path).exists(),
+        "heatmaps": hasattr(index, 'heatmaps_json_path') and index.heatmaps_json_path(path).exists(),
         "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),
         "faces": hasattr(index, 'faces_json_path') and index.faces_json_path(path).exists(),
     }
@@ -301,13 +311,13 @@ def video_metadata(name: str, directory: str = Query(".")):
     path = root / name
     if not path.exists():
         raise HTTPException(404, "video not found")
-    meta_file = index.metadata_path(path)
-    if not meta_file.exists():
+    metadata_file = index.metadata_path(path)
+    if not metadata_file.exists():
         raise HTTPException(404, "metadata not found")
     try:
-        return json.loads(meta_file.read_text())
+        return json.loads(metadata_file.read_text())
     except Exception:
-        return {"raw": meta_file.read_text()}
+        return {"raw": metadata_file.read_text()}
 
 
 @app.get("/videos/{name}/faces")
@@ -322,12 +332,75 @@ def video_faces(name: str, directory: str = Query(".")):
     return json.loads(faces_file.read_text())
 
 
+@app.get("/faces/{name}/signatures")
+def face_signatures(name: str, directory: str = Query(".")):
+    """Return persisted per-video face signatures produced by embed (404 if missing)."""
+    root = Path(directory).expanduser().resolve()
+    path = root / name
+    if not path.exists():
+        raise HTTPException(404, "video not found")
+    sig_file = index.artifact_dir(path) / f"{path.stem}.faces.signatures.json"
+    if not sig_file.exists():
+        raise HTTPException(404, "signatures not found")
+    return json.loads(sig_file.read_text())
+
+
+@app.get("/faces/listing")
+def face_listing(directory: str = Query("."), recursive: bool = Query(False), sample_rate: float = Query(1.0), cluster_eps: float = Query(0.45), cluster_min_samples: int = Query(1), offset: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=1000), gallery: Optional[str] = Query(None), gallery_sample_rate: float = Query(1.0), label_threshold: float = Query(0.40)):
+    """Generate (or return cached) global face listing index; supports pagination and optional gallery labeling."""
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "directory not found")
+    cache_file = root / ".artifacts" / ".faces.index.json"
+    regenerate = True
+    if cache_file.exists():
+        try:
+            stat = cache_file.stat()
+            # Simple heuristic: reuse if younger than 10 minutes
+            if time.time() - stat.st_mtime < 600:
+                regenerate = False
+        except Exception:
+            pass
+    if regenerate:
+        params = {
+            "sample_rate": sample_rate,
+            "cluster_eps": cluster_eps,
+            "cluster_min_samples": cluster_min_samples,
+            "gallery": gallery,
+            "gallery_sample_rate": gallery_sample_rate,
+            "label_threshold": label_threshold,
+        }
+        ns = SimpleNamespace(directory=str(root), recursive=recursive, sample_rate=sample_rate, cluster_eps=cluster_eps, cluster_min_samples=cluster_min_samples, output=None, output_format="json", gallery=gallery, gallery_sample_rate=gallery_sample_rate, label_threshold=label_threshold)
+        index_data = index.cmd_faces_index(ns)
+        try:
+            cache_file.parent.mkdir(exist_ok=True)
+            cache_file.write_text(json.dumps({"index": index_data, "params": params, "generated_at": time.time()}))
+        except Exception:
+            pass
+    try:
+        data = json.loads(cache_file.read_text()) if cache_file.exists() else {"index": {"people": [], "videos": 0}}
+        people = data.get("index", {}).get("people", [])
+    except Exception:
+        people = []
+    total = len(people)
+    slice_people = people[offset: offset + limit]
+    return {"people": slice_people, "total": total, "offset": offset, "limit": limit, "videos": data.get("index", {}).get("videos", 0)}
+
+
 @app.get("/report")
 def report(directory: str = Query("."), recursive: bool = Query(False)):
     root = Path(directory).expanduser().resolve()
     if not root.is_dir():
         raise HTTPException(404, "directory not found")
     return generate_report(root, recursive)
+
+
+@app.get("/phash/duplicates")
+def phash_duplicates(directory: str = Query("."), recursive: bool = Query(False), threshold: float = Query(0.90), limit: int = Query(0)):
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "directory not found")
+    return index.find_phash_duplicates(root, recursive, threshold, limit)
 
 
 @app.post("/jobs", response_model=JobRecord)

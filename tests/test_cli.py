@@ -40,14 +40,14 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     video.write_bytes(b"00")
     env = {"FFPROBE_DISABLE": "1"}
 
-    # meta
-    r_meta = run_cli(["meta", str(tmp_path)], env)
+    # metadata
+    r_meta = run_cli(["metadata", str(tmp_path)], env)
     assert r_meta.returncode == 0, r_meta.stderr
     assert (tmp_path / ".artifacts" / "sample.ffprobe.json").exists()
 
-    # thumb
-    r_thumb = run_cli(["thumb", str(tmp_path)], env)
-    assert r_thumb.returncode == 0, r_thumb.stderr
+    # thumbs
+    r_thumbs = run_cli(["thumbs", str(tmp_path)], env)
+    assert r_thumbs.returncode == 0, r_thumbs.stderr
     assert (tmp_path / ".artifacts" / "sample.jpg").exists()
 
     # sprites
@@ -61,9 +61,9 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     assert r_prev.returncode == 0, r_prev.stderr
     assert (tmp_path / ".artifacts" / "sample.previews.json").exists()
 
-    # subs (SRT only)
-    r_subs = run_cli(["subs", str(tmp_path)], env)
-    assert r_subs.returncode == 0, r_subs.stderr
+    # subtitles (SRT only) in .artifacts
+    r_subtitles = run_cli(["subtitles", str(tmp_path)], env)
+    assert r_subtitles.returncode == 0, r_subtitles.stderr
     assert (tmp_path / ".artifacts" / "sample.srt").exists()
 
     # phash
@@ -74,58 +74,51 @@ def test_artifact_commands_stub_mode(tmp_path: Path):
     phash_data = json.loads(phash_file.read_text())
     assert "phash" in phash_data
 
-    # heatmap
-    r_heat = run_cli(["heatmap", str(tmp_path), "--output-format", "json"], env)
+    # heatmaps
+    r_heat = run_cli(["heatmaps", str(tmp_path), "--output-format", "json"], env)
     assert r_heat.returncode == 0, r_heat.stderr
-    assert (tmp_path / ".artifacts" / "sample.heatmap.json").exists()
+    assert (tmp_path / ".artifacts" / "sample.heatmaps.json").exists()
 
     # scenes
     r_scenes = run_cli(["scenes", str(tmp_path), "--output-format", "json"], env)
     assert r_scenes.returncode == 0, r_scenes.stderr
     assert (tmp_path / ".artifacts" / "sample.scenes.json").exists()
 
-    # faces
-    r_faces = run_cli(["faces", str(tmp_path), "--output-format", "json"], env)
-    assert r_faces.returncode == 0, r_faces.stderr
-    assert (tmp_path / ".artifacts" / "sample.faces.json").exists()
+    # embed (per-video distinct signatures)
+    r_embed = run_cli(["embed", str(tmp_path), "--output-format", "json"], env)
+    assert r_embed.returncode == 0, r_embed.stderr
+    # listing (global index)
+    r_listing = run_cli(["listing", str(tmp_path), "--output-format", "json"], env)
+    assert r_listing.returncode == 0, r_listing.stderr
 
     # report
     r_report = run_cli(["report", str(tmp_path), "--output-format", "json"], env)
     assert r_report.returncode == 0, r_report.stderr
     report_json = json.loads(r_report.stdout)
     # All artifacts should have count 1
-    for key in ["metadata","thumb","sprites","previews","subs","phash","heatmap","scenes","faces"]:
+    for key in ["metadata","thumbs","sprites","previews","subtitles","phash","heatmaps","scenes"]:
         assert report_json["counts"][key] == 1, f"{key} missing in report"
         assert report_json["coverage"][key] == 1.0
+    # faces artifact not produced by embed/listing pipeline; expect 0
+    assert report_json["counts"]["faces"] == 0
 
 
-def test_actor_build_and_match_stub(tmp_path: Path):
-    people = tmp_path / "people"
-    actor_dir = people / "A"
-    actor_dir.mkdir(parents=True)
-    (actor_dir / "a.jpg").write_bytes(b"00")
-    env = {"DEEPFACE_STUB": "1"}
-    emb = tmp_path / "gallery.npy"
-    lab = tmp_path / "labels.json"
-    r_build = run_cli(["actor-build", "--people-dir", str(people), "--embeddings", str(emb), "--labels", str(lab)], env)
-    assert r_build.returncode == 0, r_build.stderr
-    video = tmp_path / "v.mp4"
-    video.write_bytes(b"00")
-    r_match = run_cli(["actor-match", "--video", str(video), "--embeddings", str(emb), "--labels", str(lab)], env)
-    assert r_match.returncode == 0, r_match.stderr
-    faces_file = tmp_path / ".artifacts" / "v.faces.json"
-    assert faces_file.exists()
-    data = json.loads(faces_file.read_text())
-    assert data["detections"][0]["accepted_label"] == "A"
-    client = TestClient(api.app)
-    resp = client.get(f"/videos/{video.name}/faces", params={"directory": str(tmp_path)})
-    assert resp.status_code == 200
-    assert resp.json()["detections"][0]["accepted_label"] == "A"
-def test_meta_parallel_stub_mode(tmp_path: Path):
+def test_dupes_stub(tmp_path: Path):
+    # Two identical tiny mp4 files -> identical phash in stub mode likely
+    env = {"FFPROBE_DISABLE": "1"}
+    (tmp_path / "a.mp4").write_bytes(b"00")
+    (tmp_path / "b.mp4").write_bytes(b"00")
+    # generate phash artifacts
+    r1 = run_cli(["phash", str(tmp_path), "--frames", "1"], env)
+    assert r1.returncode == 0, r1.stderr
+    r_dupes = run_cli(["dupes", str(tmp_path)], env)
+    assert r_dupes.returncode == 0, r_dupes.stderr
+
+def test_metadata_parallel_stub_mode(tmp_path: Path):
     (tmp_path / "a.mp4").write_bytes(b"00")
     (tmp_path / "b.mp4").write_bytes(b"0000")
     env = {"FFPROBE_DISABLE": "1"}
-    proc = run_cli(["meta", str(tmp_path), "--workers", "2"], env)
+    proc = run_cli(["metadata", str(tmp_path), "--workers", "2"], env)
     assert proc.returncode == 0, proc.stderr
     assert (tmp_path / ".artifacts" / "a.ffprobe.json").exists()
     assert (tmp_path / ".artifacts" / "b.ffprobe.json").exists()
@@ -143,4 +136,36 @@ def test_list_sort_show_size(tmp_path: Path):
     assert "10.0B" in lines[0]
     assert lines[1].startswith("small.mp4")
     assert "5.0B" in lines[1]
+
+
+def test_orphans_and_rename(tmp_path: Path):
+    video = tmp_path / "old.mp4"
+    video.write_bytes(b"00")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir(exist_ok=True)
+    (art_dir / "old.ffprobe.json").write_text("{}")
+    proc = run_cli(["rename", str(video), str(tmp_path / "new.mp4")])
+    assert proc.returncode == 0, proc.stderr
+    assert not video.exists()
+    assert (tmp_path / "new.mp4").exists()
+    # Accept either renamed artifact or removal
+    assert not (art_dir / "old.ffprobe.json").exists() or (art_dir / "new.ffprobe.json").exists()
+    # Create an orphan artifact and list
+    (art_dir / "ghost.ffprobe.json").write_text("{}")
+    proc2 = run_cli(["orphans", str(tmp_path), "--output-format", "json"])
+    assert proc2.returncode == 0
+    # Structure check only (implementation-specific filtering)
+    _ = json.loads(proc2.stdout)
+
+
+def test_codecs_and_transcode_dry_run(tmp_path: Path):
+    (tmp_path / "a.mp4").write_bytes(b"00")
+    (tmp_path / "b.mp4").write_bytes(b"00")
+    env = {"FFPROBE_DISABLE": "1"}
+    r_codecs = run_cli(["codecs", str(tmp_path), "--output-format", "json"], env)
+    assert r_codecs.returncode == 0, r_codecs.stderr
+    dest = tmp_path / "out"
+    r_trans = run_cli(["transcode", str(tmp_path), str(dest), "--dry-run", "--force", "--output-format", "json"], env)
+    assert r_trans.returncode == 0, r_trans.stderr
+    assert not any(dest.glob("*.mp4"))
 

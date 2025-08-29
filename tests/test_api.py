@@ -36,12 +36,12 @@ def test_health_and_videos(tmp_path):
         assert r.status_code in (400, 404)
 
 
-def test_job_meta_and_report(tmp_path, monkeypatch):
+def test_job_metadata_and_report(tmp_path, monkeypatch):
     monkeypatch.setenv("FFPROBE_DISABLE", "1")
     (tmp_path / "v.mp4").write_bytes(b"00")
     with TestClient(api.app) as client:
         payload = {
-            "task": "meta",
+            "task": "metadata",
             "directory": str(tmp_path),
             "recursive": False,
             "force": True,
@@ -62,3 +62,36 @@ def test_job_meta_and_report(tmp_path, monkeypatch):
         data = report.json()
         assert data["counts"]["metadata"] == 1
     assert (tmp_path / ".artifacts" / "v.ffprobe.json").exists()
+
+
+def test_api_dupes_and_embed_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    (tmp_path / "x.mp4").write_bytes(b"00")
+    (tmp_path / "y.mp4").write_bytes(b"00")
+    with TestClient(api.app) as client:
+        # phash job
+        job = client.post("/jobs", json={"task": "phash", "directory": str(tmp_path), "params": {"frames": 1}}).json()
+        for _ in range(30):
+            j = client.get(f"/jobs/{job['id']}").json()
+            if j["status"] == "done":
+                break
+            time.sleep(0.1)
+        # dupes endpoint
+        r_dup = client.get("/phash/duplicates", params={"directory": str(tmp_path), "threshold": 0.5})
+        assert r_dup.status_code == 200
+        assert "pairs" in r_dup.json()
+        # embed job
+        job2 = client.post("/jobs", json={"task": "embed", "directory": str(tmp_path), "params": {"sample_rate": 1.0}}).json()
+        for _ in range(30):
+            j2 = client.get(f"/jobs/{job2['id']}").json()
+            if j2["status"] in ("done", "error"):
+                break
+            time.sleep(0.1)
+        assert j2["status"] == "done"
+        assert j2["result"] == 0
+
+
+def test_api_invalid_task():
+    with TestClient(api.app) as client:
+        r = client.post("/jobs", json={"task": "not-a-task", "directory": "."})
+        assert r.status_code == 400
