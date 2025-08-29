@@ -31,7 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -44,6 +44,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static defaults for frontend consumption
+DEFAULT_CONFIG = {
+    "thumbs": {"time": "middle", "quality": 2},
+    "sprites": {"interval": 10, "width": 320, "cols": 10, "rows": 10, "quality": 4},
+    "previews": {"segments": 9, "duration": 1.0, "width": 320, "format": "webm", "crf": 30, "bitrate": "300k"},
+    "subtitles": {"model": "small", "backend": "auto", "workers": 1},
+    "phash": {"frames": 5, "algo": "ahash", "combine": "xor"},
+    "heatmaps": {"interval": 5.0, "mode": "both"},
+    "scenes": {"threshold": 0.4, "limit": 0},
+    "faces": {"embed_sample_rate": 1.0, "listing_cluster_eps": 0.45},
+    "tags": {"min_occurrences": 1},
+}
+
+@app.get("/config")
+def get_config():
+    return {"config": DEFAULT_CONFIG, "version": app.version}
 
 # ---------------------------------------------------------------------------
 # In-memory job store
@@ -268,7 +285,7 @@ def health():
 
 
 @app.get("/videos")
-def list_videos(directory: str = Query("."), recursive: bool = Query(False), offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000), q: Optional[str] = Query(None)):
+def list_videos(request: Request, directory: str = Query("."), recursive: bool = Query(False), offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000), q: Optional[str] = Query(None), tags: Optional[str] = Query(None), performers: Optional[str] = Query(None), match_any: bool = Query(False), detail: bool = Query(False)):
     root = Path(directory).expanduser().resolve()
     if not root.is_dir():
         raise HTTPException(404, "directory not found")
@@ -276,12 +293,75 @@ def list_videos(directory: str = Query("."), recursive: bool = Query(False), off
     if q:
         qlow = q.lower()
         vids_all = [p for p in vids_all if qlow in p.name.lower()]
+    # Tag filtering
+    if tags or performers:
+        tag_set = {t.strip() for t in (tags.split(',') if tags else []) if t.strip()}
+        perf_set = {t.strip() for t in (performers.split(',') if performers else []) if t.strip()}
+        filtered = []
+        for p in vids_all:
+            tfile = index.artifact_dir(p) / f"{p.stem}.tags.json"
+            if not tfile.exists():
+                continue
+            try:
+                data = json.loads(tfile.read_text())
+            except Exception:
+                continue
+            vt = set(data.get("tags", []) or [])
+            vp = set(data.get("performers", []) or [])
+            cond_tags = not tag_set or ((vt & tag_set) if match_any else tag_set.issubset(vt))
+            cond_perf = not perf_set or ((vp & perf_set) if match_any else perf_set.issubset(vp))
+            if cond_tags and cond_perf:
+                filtered.append(p)
+        vids_all = filtered
     total = len(vids_all)
     slice_v = vids_all[offset: offset + limit]
-    etag_base = f"{root}:{recursive}:{total}:{offset}:{limit}:{q or ''}".encode()
+    etag_base = f"{root}:{recursive}:{total}:{offset}:{limit}:{q or ''}:{tags or ''}:{performers or ''}:{int(match_any)}".encode()
     import hashlib
     etag = hashlib.sha1(etag_base).hexdigest()
-    return {"directory": str(root), "count": total, "videos": [str(p) for p in slice_v], "offset": offset, "limit": limit, "etag": etag}
+    inm = request.headers.get("if-none-match")
+    if inm and inm.strip('"') == etag:
+        raise HTTPException(status_code=304, detail="not modified")
+    videos_out: List[Any] = [str(p) for p in slice_v]
+    if detail:
+        detailed = []
+        for p in slice_v:
+            info: Dict[str, Any] = {"path": str(p), "name": p.name, "size": p.stat().st_size}
+            # tags
+            tfile = index.artifact_dir(p) / f"{p.stem}.tags.json"
+            if tfile.exists():
+                try:
+                    tdata = json.loads(tfile.read_text())
+                    info["tags"] = tdata.get("tags", [])
+                    info["performers"] = tdata.get("performers", [])
+                except Exception:
+                    info["tags"] = []
+                    info["performers"] = []
+            else:
+                info["tags"] = []
+                info["performers"] = []
+            # metadata duration if present
+            mfile = index.metadata_path(p)
+            if mfile.exists():
+                try:
+                    mdata = json.loads(mfile.read_text())
+                    dur = None
+                    # try common ffprobe structure
+                    fmt = mdata.get("format") if isinstance(mdata, dict) else None
+                    if isinstance(fmt, dict):
+                        d = fmt.get("duration")
+                        if d is not None:
+                            try:
+                                dur = float(d)
+                            except Exception:
+                                pass
+                    if dur is not None:
+                        info["duration"] = dur
+                except Exception:
+                    pass
+            detailed.append(info)
+        videos_out = detailed
+    resp = {"directory": str(root), "count": total, "videos": videos_out, "offset": offset, "limit": limit, "etag": etag}
+    return resp
 
 
 @app.get("/videos/{name}/artifacts")
@@ -318,6 +398,182 @@ def video_metadata(name: str, directory: str = Query(".")):
         return json.loads(metadata_file.read_text())
     except Exception:
         return {"raw": metadata_file.read_text()}
+
+@app.get("/videos/{name}/tags")
+def get_video_tags(name: str, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    path = root / name
+    if not path.exists():
+        raise HTTPException(404, "video not found")
+    tfile = index.artifact_dir(path) / f"{path.stem}.tags.json"
+    if not tfile.exists():
+        return {"video": name, "tags": [], "performers": []}
+    try:
+        return json.loads(tfile.read_text())
+    except Exception:
+        raise HTTPException(500, "invalid tags file")
+
+class TagUpdate(BaseModel):
+    add: list[str] | None = None
+    remove: list[str] | None = None
+    performers_add: list[str] | None = None
+    performers_remove: list[str] | None = None
+    replace: bool = False
+
+@app.patch("/videos/{name}/tags")
+def update_video_tags(name: str, payload: TagUpdate, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    path = root / name
+    if not path.exists():
+        raise HTTPException(404, "video not found")
+    tfile = index.artifact_dir(path) / f"{path.stem}.tags.json"
+    if tfile.exists():
+        try:
+            data = json.loads(tfile.read_text())
+        except Exception:
+            data = {"video": name, "tags": [], "performers": []}
+    else:
+        data = {"video": name, "tags": [], "performers": []}
+    if payload.replace and payload.add is not None:
+        data["tags"] = []
+    if payload.add:
+        for t in payload.add:
+            if t not in data["tags"]:
+                data["tags"].append(t)
+    if payload.remove:
+        data["tags"] = [t for t in data["tags"] if t not in payload.remove]
+    if payload.performers_add:
+        for t in payload.performers_add:
+            if t not in data["performers"]:
+                data["performers"].append(t)
+    if payload.performers_remove:
+        data["performers"] = [t for t in data["performers"] if t not in payload.performers_remove]
+    # Write back
+    try:
+        tfile.write_text(json.dumps(data, indent=2))
+    except Exception:
+        raise HTTPException(500, "failed to write tags")
+    return data
+
+@app.get("/videos/{name}")
+def video_detail(name: str, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    path = root / name
+    if not path.exists():
+        raise HTTPException(404, "video not found")
+    # Base info
+    info: Dict[str, Any] = {"video": name, "size": path.stat().st_size}
+    # Artifact presence
+    s, j = index.sprite_sheet_paths(path)
+    info["artifacts"] = {
+        "metadata": index.metadata_path(path).exists(),
+        "thumbs": index.thumbs_path(path).exists(),
+        "sprites": s.exists() and j.exists(),
+        "previews": index.preview_index_path(path).exists(),
+        "subtitles": index.find_subtitles(path) is not None,
+        "phash": index.phash_path(path).exists(),
+        "heatmaps": hasattr(index, 'heatmaps_json_path') and index.heatmaps_json_path(path).exists(),
+        "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),
+        "faces": hasattr(index, 'faces_json_path') and index.faces_json_path(path).exists(),
+    }
+    # Tags
+    tfile = index.artifact_dir(path) / f"{path.stem}.tags.json"
+    if tfile.exists():
+        try:
+            tdata = json.loads(tfile.read_text())
+            info["tags"] = tdata.get("tags", [])
+            info["performers"] = tdata.get("performers", [])
+        except Exception:
+            info["tags"] = []
+            info["performers"] = []
+    else:
+        info["tags"] = []
+        info["performers"] = []
+    # Duration quick read
+    mfile = index.metadata_path(path)
+    if mfile.exists():
+        try:
+            mdata = json.loads(mfile.read_text())
+            fmt = mdata.get("format") if isinstance(mdata, dict) else None
+            if isinstance(fmt, dict):
+                d = fmt.get("duration")
+                if d is not None:
+                    try:
+                        info["duration"] = float(d)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return info
+
+@app.get("/tags/export")
+def export_tags(directory: str = Query("."), recursive: bool = Query(False)):
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "directory not found")
+    result = []
+    for v in index.find_mp4s(root, recursive):
+        tfile = index.artifact_dir(v) / f"{v.stem}.tags.json"
+        if tfile.exists():
+            try:
+                data = json.loads(tfile.read_text())
+                result.append(data)
+            except Exception:
+                pass
+    return {"videos": result}
+
+class BulkImport(BaseModel):
+    videos: list[Dict[str, Any]]
+
+@app.post("/tags/import")
+def import_tags(payload: BulkImport, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "directory not found")
+    written = 0
+    for entry in payload.videos:
+        name = entry.get("video")
+        if not name:
+            continue
+        path = root / name
+        if not path.exists():
+            continue
+        try:
+            (index.artifact_dir(path) / f"{path.stem}.tags.json").write_text(json.dumps({
+                "video": name,
+                "tags": entry.get("tags", []),
+                "performers": entry.get("performers", []),
+            }, indent=2))
+            written += 1
+        except Exception:
+            pass
+    return {"written": written}
+
+@app.get("/tags/summary")
+def tags_summary(directory: str = Query("."), recursive: bool = Query(False)):
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "directory not found")
+    tag_counts: Dict[str, int] = {}
+    perf_counts: Dict[str, int] = {}
+    videos_with_tags = 0
+    for v in index.find_mp4s(root, recursive):
+        tfile = index.artifact_dir(v) / f"{v.stem}.tags.json"
+        if not tfile.exists():
+            continue
+        try:
+            data = json.loads(tfile.read_text())
+        except Exception:
+            continue
+        tags_list = data.get("tags", []) or []
+        perf_list = data.get("performers", []) or []
+        if tags_list or perf_list:
+            videos_with_tags += 1
+        for t in tags_list:
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+        for p in perf_list:
+            perf_counts[p] = perf_counts.get(p, 0) + 1
+    return {"tags": tag_counts, "performers": perf_counts, "videos": videos_with_tags}
 
 
 @app.get("/videos/{name}/faces")

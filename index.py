@@ -557,7 +557,11 @@ def generate_thumbnail(video: Path, force: bool, time_spec: str, quality: int) -
 def cmd_thumbs(ns) -> int:
     """Generate a single thumbnail per video (time chosen by --time) with skip-aware progress."""
     root = Path(ns.directory).expanduser().resolve()
-    if not root.is_dir():
+    # Accept direct single video file path
+    if root.is_file() and root.suffix.lower() == '.mp4':
+        # treat as single file mode; parent becomes root for artifact directory logic
+        pass
+    elif not root.is_dir():
         print(f"Error: directory not found: {root}", file=sys.stderr)
         return 2
     videos = find_mp4s(root, ns.recursive)
@@ -2084,6 +2088,20 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     fn.add_argument("-r", "--recursive", action="store_true")
     fn.add_argument("--workers", type=int, default=2)
 
+    tg = sub.add_parser("tags", help="Apply or list tags (performers + user tags) for videos")
+    tg.add_argument("directory", nargs="?", default=".", help="Directory or single video .mp4 path")
+    tg.add_argument("-r", "--recursive", action="store_true")
+    tg.add_argument("--list", action="store_true", help="List tags for videos (no changes)")
+    tg.add_argument("--set", default=None, help="Comma list of user tags to add (e.g. genre1,tag2)")
+    tg.add_argument("--performers", action="store_true", help="Infer performer tags from face listing (requires prior embed+listing)")
+    tg.add_argument("--min-occurrences", type=int, default=1, help="Minimum occurrences in a video to tag with a performer (default 1)")
+    tg.add_argument("--output-format", choices=["json","text"], default="text")
+    tg.add_argument("--remove", default=None, help="Comma list of user tags to remove")
+    tg.add_argument("--mode", choices=["add","replace"], default="add", help="Merge strategy for --set tags (add = append new; replace = overwrite tag list with provided set)")
+    tg.add_argument("--refresh-performers", action="store_true", help="Recompute performer tags (replace existing performers list)")
+    tg.add_argument("--clear-performers", action="store_true", help="Remove all performer tags (applied before additions)")
+    tg.add_argument("--remove-performers", default=None, help="Comma list of performer labels to remove (after any additions)")
+
     # Deprecated face-related commands removed in favor of embed / listing.
 
     rn = sub.add_parser("rename", help="Rename a video and associated artifacts")
@@ -3404,6 +3422,136 @@ def cmd_metadata(ns) -> int:
     print(f"Metadata done for {result['total']} file(s)")
     return 0
 
+def video_tags_path(video: Path) -> Path:
+    return artifact_dir(video) / f"{video.stem}.tags.json"
+
+def load_video_tags(video: Path) -> dict:
+    p = video_tags_path(video)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {"video": video.name, "tags": [], "performers": []}
+    return {"video": video.name, "tags": [], "performers": []}
+
+def save_video_tags(video: Path, data: dict) -> None:
+    data.setdefault("video", video.name)
+    data.setdefault("tags", [])
+    data.setdefault("performers", [])
+    # Ensure deterministic ordering & dedupe
+    data["tags"] = sorted(dict.fromkeys(data.get("tags", [])))
+    data["performers"] = sorted(dict.fromkeys(data.get("performers", [])))
+    p = video_tags_path(video)
+    p.parent.mkdir(exist_ok=True)
+    tmp = p.with_suffix(p.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, p)
+
+def cmd_tags(ns) -> int:
+    """List or apply tags to videos. Performer tags derived from face listing cache.
+
+    Workflow:
+      1. Optionally load global listing cache (.faces.index.json) to map performer IDs -> label (or id) and per-video occurrences.
+      2. For each video, load existing tags JSON artifact if any.
+      3. Apply user tags (--set) adding (dedup) to tags list.
+      4. If --performers, assign performer labels (or raw IDs) that meet occurrence threshold in that video.
+      5. Write updated tags file unless --list.
+    """
+    target = Path(ns.directory).expanduser().resolve()
+    if target.is_file() and target.suffix.lower() == '.mp4':
+        videos = [target]
+        root = target.parent
+    else:
+        root = target
+        if not root.is_dir():
+            print(f"Error: directory not found: {root}", file=sys.stderr)
+            return 2
+        videos = find_mp4s(root, ns.recursive)
+    if not videos:
+        if ns.output_format == "text":
+            print("No MP4 files found.")
+        else:
+            print(json.dumps({"videos": []}))
+        return 0
+    # Load listing cache if performers requested
+    performer_map: dict[str, dict] = {}
+    video_performer_occ: dict[str, dict[str,int]] = {}
+    if ns.performers:
+        cache_file = root / ARTIFACTS_DIR / ".faces.index.json"
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text())
+                people = data.get("index", {}).get("people") if isinstance(data.get("index"), dict) else data.get("people", [])
+                if isinstance(people, list):
+                    for person in people:
+                        pid = str(person.get("id"))
+                        label = person.get("label") or pid
+                        performer_map[pid] = {"id": pid, "label": label}
+                        for occ in person.get("occurrences", []) or []:
+                            v = occ.get("video")
+                            if not v:
+                                continue
+                            video_performer_occ.setdefault(v, {})
+                            video_performer_occ[v][pid] = video_performer_occ[v].get(pid, 0) + 1
+            except Exception:
+                pass
+    user_tags: list[str] = []
+    if ns.set:
+        user_tags = [t.strip() for t in ns.set.split(',') if t.strip()]
+    remove_tags: list[str] = []
+    if getattr(ns, 'remove', None):
+        remove_tags = [t.strip() for t in ns.remove.split(',') if t.strip()]
+    remove_performers: list[str] = []
+    if getattr(ns, 'remove_performers', None):
+        remove_performers = [t.strip() for t in ns.remove_performers.split(',') if t.strip()]
+    results = []
+    for v in videos:
+        rec = load_video_tags(v)
+        original = json.dumps(rec, sort_keys=True)
+        # Clear performers if requested
+        if ns.clear_performers:
+            rec["performers"] = []
+        # Mode replace for user tags
+        if ns.mode == "replace" and user_tags:
+            rec["tags"] = []
+        # Add user tags
+        for t in user_tags:
+            if t not in rec["tags"]:
+                rec["tags"].append(t)
+        # Remove user tags
+        if remove_tags:
+            rec["tags"] = [t for t in rec["tags"] if t not in remove_tags]
+        # Performer tags: compute new set if requested
+        if ns.performers and v.name in video_performer_occ:
+            perfs_here = [pid for pid, cnt in video_performer_occ[v.name].items() if cnt >= ns.min_occurrences]
+            new_labels = []
+            for pid in perfs_here:
+                label = performer_map.get(pid, {}).get("label", pid)
+                new_labels.append(label)
+            if ns.refresh_performers:
+                rec["performers"] = []
+            for lbl in new_labels:
+                if lbl not in rec["performers"]:
+                    rec["performers"].append(lbl)
+        # Remove specific performers
+        if remove_performers:
+            rec["performers"] = [p for p in rec["performers"] if p not in remove_performers]
+        changed = (json.dumps(rec, sort_keys=True) != original)
+        if not ns.list and changed:
+            try:
+                save_video_tags(v, rec)
+            except Exception as e:  # noqa: BLE001
+                print(f"Warning: failed to write tags for {v.name}: {e}", file=sys.stderr)
+        results.append(rec)
+    if ns.output_format == "json":
+        print(json.dumps({"videos": results}, indent=2))
+    else:
+        for r in results:
+            tags = ",".join(sorted(r.get("tags", [])))
+            perfs = ",".join(sorted(r.get("performers", [])))
+            print(f"{r['video']}: tags=[{tags}] performers=[{perfs}]")
+    return 0
+
 def resolve_directory(ns):
     """Consolidate logic for setting ns.directory from ns.dir."""
     if getattr(ns, "dir", None):
@@ -3412,28 +3560,16 @@ def resolve_directory(ns):
             ns.directory = ns.dir
     return ns
 
-def main(argv: List[str] | None = None) -> int:
-    raw_args = argv or sys.argv[1:]
-    ns = parse_args(raw_args)
-    # Fallback: user supplied directory then command (e.g. './index.py /path orphans')
-    command_names = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish"}
-    if ns.cmd not in command_names and raw_args:
-        first = raw_args[0]
-        if Path(first).exists() and len(raw_args) > 1 and raw_args[1] in command_names:
-            # Reinterpret as path-first; rebuild argv swapping first two
-            reordered = [raw_args[1], first] + raw_args[2:]
-            ns = parse_args(reordered)
-            ns = resolve_directory(ns)
-            print(f"(note) path-first invocation detected; treating '{first}' as directory and '{raw_args[1]}' as command. Preferred usage: {Path(sys.argv[0]).name} {raw_args[1]} {first}", file=sys.stderr)
-    ns = resolve_directory(ns)
+# Unified command name set (keep in sync with subparsers)
+COMMAND_NAMES = {"list","report","orphans","metadata","thumbs","sprites","previews","subtitles","phash","dupes","heatmaps","scenes","embed","listing","rename","codecs","transcode","compare","batch","finish","tags"}
 
+def dispatch_command(ns) -> int:
     if ns.cmd == "list": return cmd_list(ns)
     if ns.cmd == "report": return cmd_report(ns)
     if ns.cmd == "orphans": return cmd_orphans(ns)
     if ns.cmd == "batch": return cmd_batch(ns)
     if ns.cmd == "finish": return cmd_finish(ns)
     if ns.cmd == "rename": return cmd_rename(ns)
-
     if ns.cmd == "metadata": return cmd_metadata(ns)
     if ns.cmd == "thumbs": return cmd_thumbs(ns)
     if ns.cmd == "sprites": return cmd_sprites(ns)
@@ -3446,14 +3582,71 @@ def main(argv: List[str] | None = None) -> int:
     if ns.cmd == "codecs": return cmd_codecs(ns)
     if ns.cmd == "transcode": return cmd_transcode(ns)
     if ns.cmd == "compare": return cmd_compare(ns)
-    
     if ns.cmd == "embed": return cmd_faces_embed(ns)
     if ns.cmd == "listing":
-        cmd_faces_index(ns)  # returns dict; CLI expects exit code so ignore value
+        cmd_faces_index(ns)
         return 0
-
+    if ns.cmd == "tags": return cmd_tags(ns)
     print("Unknown command", file=sys.stderr)
     return 1
+
+def main(argv: List[str] | None = None) -> int:
+    raw_args = argv or sys.argv[1:]
+    # Multi-command (comma separated) convenience without recursive main calls.
+    # Forms supported:
+    #   index.py /path thumbs,sprites
+    #   index.py thumbs,sprites /path -r --force
+    #   index.py thumbs,sprites
+    if raw_args:
+        for i, tok in enumerate(raw_args):
+            if ',' in tok and not tok.startswith('-'):
+                parts = [p for p in tok.split(',') if p]
+                if not parts or not all(p in COMMAND_NAMES for p in parts):
+                    continue
+                # Detect directory token (simple heuristic: a path-like token adjacent not a command or flag)
+                directory = '.'
+                dir_token_idx = None
+                # Check prev
+                if i > 0:
+                    prev = raw_args[i-1]
+                    if (prev not in COMMAND_NAMES and not prev.startswith('-') and ('/' in prev or Path(prev).exists())):
+                        directory = prev
+                        dir_token_idx = i-1
+                # Check next if not found
+                if dir_token_idx is None and i + 1 < len(raw_args):
+                    nxt = raw_args[i+1]
+                    if (nxt not in COMMAND_NAMES and not nxt.startswith('-') and ('/' in nxt or Path(nxt).exists())):
+                        directory = nxt
+                        dir_token_idx = i+1
+                # Shared flags: all tokens except the multi token and directory token (if any)
+                skip_idxs = {i}
+                if dir_token_idx is not None:
+                    skip_idxs.add(dir_token_idx)
+                shared_flags = [a for j, a in enumerate(raw_args) if j not in skip_idxs]
+                overall_rc = 0
+                for cmd_name in parts:
+                    per = [cmd_name]
+                    if directory != '.':
+                        per.append(directory)
+                    per.extend(shared_flags)
+                    ns_each = parse_args(per)
+                    ns_each = resolve_directory(ns_each)
+                    rc = dispatch_command(ns_each)
+                    if rc != 0:
+                        overall_rc = rc
+                return overall_rc
+    ns = parse_args(raw_args)
+    # Fallback: user supplied directory then command (e.g. './index.py /path orphans')
+    if ns.cmd not in COMMAND_NAMES and raw_args:
+        first = raw_args[0]
+        if Path(first).exists() and len(raw_args) > 1 and raw_args[1] in COMMAND_NAMES:
+            # Reinterpret as path-first; rebuild argv swapping first two
+            reordered = [raw_args[1], first] + raw_args[2:]
+            ns = parse_args(reordered)
+            ns = resolve_directory(ns)
+            print(f"(note) path-first invocation detected; treating '{first}' as directory and '{raw_args[1]}' as command. Preferred usage: {Path(sys.argv[0]).name} {raw_args[1]} {first}", file=sys.stderr)
+    ns = resolve_directory(ns)
+    return dispatch_command(ns)
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

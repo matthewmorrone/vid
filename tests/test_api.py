@@ -95,3 +95,40 @@ def test_api_invalid_task():
     with TestClient(api.app) as client:
         r = client.post("/jobs", json={"task": "not-a-task", "directory": "."})
         assert r.status_code == 400
+
+
+def test_api_tags_endpoints(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    (tmp_path / "a.mp4").write_bytes(b"00")
+    with TestClient(api.app) as client:
+        # Initially empty
+        r0 = client.get(f"/videos/a.mp4/tags", params={"directory": str(tmp_path)})
+        assert r0.status_code == 200
+        assert r0.json()["tags"] == []
+        # Add tags via PATCH
+        r1 = client.patch(f"/videos/a.mp4/tags", params={"directory": str(tmp_path)}, json={"add": ["x", "y"]})
+        assert r1.status_code == 200
+        assert set(r1.json()["tags"]) == {"x", "y"}
+        # Remove one and add another
+        r2 = client.patch(f"/videos/a.mp4/tags", params={"directory": str(tmp_path)}, json={"remove": ["x"], "add": ["z"]})
+        assert r2.status_code == 200
+        assert set(r2.json()["tags"]) == {"y", "z"}
+        # Summary
+        rs = client.get("/tags/summary", params={"directory": str(tmp_path)})
+        assert rs.status_code == 200
+        summ = rs.json()
+        assert summ["tags"].get("y") == 1
+        assert summ["tags"].get("z") == 1
+        # Filtering (match all)
+        rf = client.get("/videos", params={"directory": str(tmp_path), "tags": "y,z"})
+        assert rf.status_code == 200
+        assert rf.json()["count"] == 1
+        # Filtering (match any)
+        rfa = client.get("/videos", params={"directory": str(tmp_path), "tags": "y,foo", "match_any": 1})
+        assert rfa.status_code == 200
+        assert rfa.json()["count"] == 1
+        # ETag conditional
+        first = client.get("/videos", params={"directory": str(tmp_path)})
+        etag = first.json()["etag"]
+        not_mod = client.get("/videos", params={"directory": str(tmp_path)}, headers={"If-None-Match": etag})
+        assert not_mod.status_code == 304

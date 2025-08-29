@@ -169,3 +169,35 @@ def test_codecs_and_transcode_dry_run(tmp_path: Path):
     assert r_trans.returncode == 0, r_trans.stderr
     assert not any(dest.glob("*.mp4"))
 
+
+def test_tags_cli_basic(tmp_path: Path):
+    # create video
+    (tmp_path / "t.mp4").write_bytes(b"00")
+    # add tags
+    r_add = run_cli(["tags", str(tmp_path / "t.mp4"), "--set", "alpha,beta", "--output-format", "json"])
+    assert r_add.returncode == 0, r_add.stderr
+    # append
+    r_add2 = run_cli(["tags", str(tmp_path / "t.mp4"), "--set", "beta,gamma", "--output-format", "json"])
+    assert r_add2.returncode == 0, r_add2.stderr
+    data = (tmp_path / ".artifacts" / "t.tags.json").read_text()
+    assert "alpha" in data and "gamma" in data
+    # remove
+    r_rem = run_cli(["tags", str(tmp_path / "t.mp4"), "--remove", "alpha", "--output-format", "json"])
+    assert r_rem.returncode == 0
+    after = (tmp_path / ".artifacts" / "t.tags.json").read_text()
+    assert "alpha" not in after
+    # replace
+    r_rep = run_cli(["tags", str(tmp_path / "t.mp4"), "--set", "solo", "--mode", "replace", "--output-format", "json"])
+    assert r_rep.returncode == 0
+    rep = (tmp_path / ".artifacts" / "t.tags.json").read_text()
+    assert "solo" in rep and "beta" not in rep and "gamma" not in rep
+
+
+def test_multi_command_parsing(tmp_path: Path):
+    (tmp_path / "m.mp4").write_bytes(b"00")
+    env = {"FFPROBE_DISABLE": "1"}
+    proc = run_cli(["metadata,thumbs", str(tmp_path)], env)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / ".artifacts" / "m.ffprobe.json").exists()
+    assert (tmp_path / ".artifacts" / "m.jpg").exists()
+

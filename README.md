@@ -35,7 +35,15 @@ python index.py transcode [dir] dest [-r] [--target-v h264] [--target-a aac] [--
 python index.py compare original.mp4 other.mp4 [--output-format json|text]
 python index.py report [dir] [-r] [--output-format json|text]
 python index.py faces [dir] [-r] [--frame-rate 1.0] [--eps 0.5] [--min-samples 2] [--output faces.json]
+python index.py tags <video|dir> [-r] [--set tag1,tag2] [--remove t1,t2] [--mode add|replace] [--performers] [--min-occurrences N] [--refresh-performers] [--clear-performers] [--remove-performers p1,p2] [--output-format json|text]
 ```
+
+Multi‑command shortcut:
+You can chain comma‑separated commands in a single invocation; they run sequentially with the same directory / flags (per‑command specific flags still parsed where applicable):
+```
+python index.py meta,thumbs,sprites ~/videos -r --workers 2
+```
+Equivalent to running each command separately in that order.
 
 `list`:
 	Show MP4 files. Optional JSON output, human sizes, recursion, sorting.
@@ -97,6 +105,25 @@ python index.py faces [dir] [-r] [--frame-rate 1.0] [--eps 0.5] [--min-samples 2
 `report`:
         Summarize library artifact coverage: counts & percentages for metadata, thumbnail, sprites, previews, subtitles, phash, heatmaps, scenes. Outputs per-file presence matrix (JSON mode) or a concise table (text mode).
 
+`tags`:
+	Manage user + performer tags per video. Stores JSON artifacts at `.artifacts/<video>.tags.json`:
+	`{ "video": "relative/path.mp4", "tags": ["tag1"], "performers": ["Performer A"] }`.
+	Modes:
+	- Add (default): `--set tag1,tag2` merges (dedup).
+	- Replace: `--set ... --mode replace` replaces all existing tags.
+	- Remove: `--remove bad,old` deletes listed tags.
+	Performer helpers (use global face listing cache `.artifacts/.faces.index.json`):
+	- `--performers` infer performers whose face clusters meet `--min-occurrences` (default 2) in the video.
+	- `--refresh-performers` recompute performer list ignoring current stored performers.
+	- `--clear-performers` drop all performer entries.
+	- `--remove-performers name1,name2` selectively remove performers.
+	Examples:
+	```
+	python index.py tags movie.mp4 --set action,night
+	python index.py tags . -r --performers --min-occurrences 3
+	python index.py tags clip.mp4 --remove temp --set final --mode add
+	```
+
 Face pipeline workflow:
 1. Run `embed` (parallelizable) to create per-video signature artifacts.
 2. Run `listing` to build / refresh the global index (fast if signatures already present). Add `--gallery` to auto-label clusters.
@@ -142,6 +169,17 @@ Initial endpoints:
 - `GET /videos?directory=.&recursive=0` – List MP4 files
 - `GET /videos/{name}/artifacts?directory=.` – Artifact presence flags
 - `GET /videos/{name}/metadata?directory=.` – ffprobe metadata JSON
+- `GET /videos/{name}/tags?directory=.` – Tags + performers (empty arrays if none)
+- `POST /videos/{name}/tags` – Update tags. JSON body:
+	```json
+	{
+		"add": ["tag1"],
+		"remove": ["tag2"],
+		"performers_add": ["Actor"],
+		"performers_remove": ["OldActor"],
+		"replace": false
+	}
+	```
 - `GET /report?directory=.&recursive=0` – Coverage summary (same logic as CLI `report`)
 - `POST /jobs` – Submit an async job. Body shape:
   ```json
@@ -149,11 +187,24 @@ Initial endpoints:
   ```
 - `GET /jobs` – List jobs
 - `GET /jobs/{id}` – Job detail
+- `GET /tags/export?directory=.&recursive=0` – Bulk export all existing tag artifacts.
+- `POST /tags/import` – Bulk import. Body:
+	```json
+	{
+		"videos": [
+			{"video": "path/to/file.mp4", "tags": ["t1"], "performers": ["P1"]}
+		]
+	}
+	```
 
 Supported job tasks: metadata, thumbs, sprites, previews, subtitles, phash, dupes, heatmaps, scenes, embed, listing, codecs, transcode, report
 
 Pagination & filtering:
 - `GET /videos?offset=0&limit=100&q=foo` for paged video lists.
+- Tag / performer filtering:
+	- `GET /videos?tags=tag1,tag2` (match all tags)
+	- `GET /videos?tags=tag1,tag2&match_any=1` (match any)
+	- `GET /videos?performers=Actor1` or both `tags` + `performers`.
 - `GET /faces/listing?offset=0&limit=200` for paged people clusters (auto-caches for 10 minutes).
 
 Face artifacts:
@@ -161,6 +212,18 @@ Face artifacts:
 - Global cache: `.artifacts/.faces.index.json`
 
 Jobs are executed in-memory (ephemeral). Future enhancements (not yet implemented): cancellation, progress streaming (SSE/WebSocket), persistent queue, ML tasks (performer recognition), dedupe.
+
+### Tagging Notes
+- Tag artifacts are lightweight and can be safely edited manually (keep valid JSON).
+- Performer inference depends on first generating face signatures (`embed`) and a global listing (`listing`).
+- For large libraries, periodically refresh the global face index to keep performer counts current.
+
+### Suggestions / Next Steps
+- Add tests covering: tags CLI (add/replace/remove), API tag endpoints, /videos tag filtering.
+- Provide an aggregated tag summary endpoint (future) to list all tags with counts.
+- Add a CHANGELOG.md for tracking new features (multi-command, tagging, API tag endpoints).
+- Consider a configuration file (e.g., `videorc.json`) for default worker counts and thresholds.
+- Add a LICENSE file if distributing (MIT referenced above).
 
 ## License
 MIT (add a LICENSE file if distributing).
