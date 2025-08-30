@@ -18,7 +18,9 @@ def test_health_and_videos(tmp_path):
         assert r.status_code == 200
         body = r.json()
         assert body["count"] == 1
-        assert any(Path(p).name == "v.mp4" for p in body["videos"])
+        assert any(v["name"] == "v.mp4" for v in body["videos"])
+        for v in body["videos"]:
+            assert {"path", "name", "size"} <= v.keys()
 
         # /videos with empty directory
         empty_dir = tmp_path / "empty"

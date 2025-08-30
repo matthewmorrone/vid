@@ -441,11 +441,11 @@ def list_videos(request: Request, directory: str = Query("."), recursive: bool =
     inm = request.headers.get("if-none-match")
     if inm and inm.strip('"') == etag:
         raise HTTPException(status_code=304, detail="not modified")
-    videos_out: List[Any] = [str(p) for p in slice_v]
+    videos_out: List[Dict[str, Any]] = [
+        {"path": str(p), "name": p.name, "size": p.stat().st_size} for p in slice_v
+    ]
     if detail:
-        detailed = []
-        for p in slice_v:
-            info: Dict[str, Any] = {"path": str(p), "name": p.name, "size": p.stat().st_size}
+        for info, p in zip(videos_out, slice_v):
             # tags
             tfile = index.artifact_dir(p) / f"{p.stem}.tags.json"
             if tfile.exists():
@@ -459,7 +459,6 @@ def list_videos(request: Request, directory: str = Query("."), recursive: bool =
             else:
                 info["tags"] = []
                 info["performers"] = []
-            # metadata duration if present
             # duration / codecs from summary cache
             rel = None
             try:
@@ -474,8 +473,6 @@ def list_videos(request: Request, directory: str = Query("."), recursive: bool =
                     info["vcodec"] = summ.get("vcodec")
                 if summ.get("acodec") is not None:
                     info["acodec"] = summ.get("acodec")
-            detailed.append(info)
-        videos_out = detailed
     resp = {"directory": str(root), "count": total, "videos": videos_out, "offset": offset, "limit": limit, "etag": etag}
     return resp
 
