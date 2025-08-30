@@ -149,6 +149,58 @@ async def request_logger(request: Request, call_next):  # noqa: D401
     response.headers["X-Request-ID"] = req_id
     return response
 
+
+def build_artifact_info(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Return artifact paths/URLs alongside existence flags."""
+    s, j = index.sprite_sheet_paths(path)
+    subs_path = index.artifact_dir(path) / f"{path.stem}.srt"
+    data: Dict[str, Dict[str, Any]] = {
+        "metadata": {
+            "url": str(index.metadata_path(path)),
+            "exists": index.metadata_path(path).exists(),
+        },
+        "thumbs": {
+            "url": str(index.thumbs_path(path)),
+            "exists": index.thumbs_path(path).exists(),
+        },
+        "sprites": {
+            "sheet": str(s),
+            "index": str(j),
+            "exists": s.exists() and j.exists(),
+        },
+        "previews": {
+            "url": str(index.preview_index_path(path)),
+            "exists": index.preview_index_path(path).exists(),
+        },
+        "subtitles": {
+            "url": str(subs_path),
+            "exists": subs_path.exists(),
+        },
+        "phash": {
+            "url": str(index.phash_path(path)),
+            "exists": index.phash_path(path).exists(),
+        },
+    }
+    heatmaps_fn = getattr(index, "heatmaps_json_path", None)
+    hm = heatmaps_fn(path) if heatmaps_fn else None
+    data["heatmaps"] = {
+        "url": str(hm) if hm else None,
+        "exists": hm.exists() if hm else False,
+    }
+    scenes_fn = getattr(index, "scenes_json_path", None)
+    sc = scenes_fn(path) if scenes_fn else None
+    data["scenes"] = {
+        "url": str(sc) if sc else None,
+        "exists": sc.exists() if sc else False,
+    }
+    faces_fn = getattr(index, "faces_json_path", None)
+    fc = faces_fn(path) if faces_fn else None
+    data["faces"] = {
+        "url": str(fc) if fc else None,
+        "exists": fc.exists() if fc else False,
+    }
+    return data
+
 class JobExecutor(threading.Thread):
     def __init__(self, job_id: str):
         super().__init__(daemon=True)
@@ -474,6 +526,8 @@ def list_videos(request: Request, directory: str = Query("."), recursive: bool =
                     info["vcodec"] = summ.get("vcodec")
                 if summ.get("acodec") is not None:
                     info["acodec"] = summ.get("acodec")
+            # artifact paths/presence
+            info["artifacts"] = build_artifact_info(p)
     resp = {"directory": str(root), "count": total, "videos": videos_out, "offset": offset, "limit": limit, "etag": etag}
     return resp
 
@@ -578,18 +632,7 @@ def video_detail(name: str, directory: str = Query(".")):
     # Base info
     info: Dict[str, Any] = {"video": name, "size": path.stat().st_size}
     # Artifact presence
-    s, j = index.sprite_sheet_paths(path)
-    info["artifacts"] = {
-        "metadata": index.metadata_path(path).exists(),
-        "thumbs": index.thumbs_path(path).exists(),
-        "sprites": s.exists() and j.exists(),
-        "previews": index.preview_index_path(path).exists(),
-        "subtitles": index.find_subtitles(path) is not None,
-        "phash": index.phash_path(path).exists(),
-        "heatmaps": hasattr(index, 'heatmaps_json_path') and index.heatmaps_json_path(path).exists(),
-        "scenes": hasattr(index, 'scenes_json_path') and index.scenes_json_path(path).exists(),
-        "faces": hasattr(index, 'faces_json_path') and index.faces_json_path(path).exists(),
-    }
+    info["artifacts"] = build_artifact_info(path)
     # Tags
     tfile = index.artifact_dir(path) / f"{path.stem}.tags.json"
     if tfile.exists():
