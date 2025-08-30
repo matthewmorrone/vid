@@ -4,6 +4,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import api
+
+
 def test_health_and_videos(tmp_path):
     with TestClient(api.app) as client:
         # Health endpoint test
@@ -36,6 +38,54 @@ def test_health_and_videos(tmp_path):
         r = client.get("/videos", params={"directory": str(invalid_dir)})
         # Expecting 400 or 404 depending on API implementation, adjust as needed
         assert r.status_code in (400, 404)
+
+
+def test_video_detail_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"00")
+    thumb = tmp_path / "a.jpg"
+    thumb.write_bytes(b"fakejpg")  # Simulate thumbnail exists
+
+    with TestClient(api.app) as client:
+        # Case: artifact exists
+        r = client.get(f"/videos/{vid.name}", params={"directory": str(tmp_path)})
+        assert r.status_code == 200
+        data = r.json()
+        assert "artifacts" in data
+        tinfo = data["artifacts"]["thumbs"]
+        assert {"url", "exists"} <= tinfo.keys()
+        assert tinfo["url"].endswith(".jpg")
+        assert tinfo["exists"] is True
+
+        r_list = client.get("/videos", params={"directory": str(tmp_path), "detail": 1})
+        assert r_list.status_code == 200
+        vdata = r_list.json()["videos"][0]
+        assert "artifacts" in vdata
+        ltinfo = vdata["artifacts"]["thumbs"]
+        assert {"url", "exists"} <= ltinfo.keys()
+        assert ltinfo["url"].endswith(".jpg")
+        assert ltinfo["exists"] is True
+
+        # Case: artifact missing
+        thumb.unlink()  # Remove thumbnail
+        r_missing = client.get(f"/videos/{vid.name}", params={"directory": str(tmp_path)})
+        assert r_missing.status_code == 200
+        data_missing = r_missing.json()
+        assert "artifacts" in data_missing
+        tinfo_missing = data_missing["artifacts"]["thumbs"]
+        assert {"url", "exists"} <= tinfo_missing.keys()
+        assert tinfo_missing["url"].endswith(".jpg")
+        assert tinfo_missing["exists"] is False
+
+        r_list_missing = client.get("/videos", params={"directory": str(tmp_path), "detail": 1})
+        assert r_list_missing.status_code == 200
+        vdata_missing = r_list_missing.json()["videos"][0]
+        assert "artifacts" in vdata_missing
+        ltinfo_missing = vdata_missing["artifacts"]["thumbs"]
+        assert {"url", "exists"} <= ltinfo_missing.keys()
+        assert ltinfo_missing["url"].endswith(".jpg")
+        assert ltinfo_missing["exists"] is False
 
 
 def test_job_metadata_and_report(tmp_path, monkeypatch):
