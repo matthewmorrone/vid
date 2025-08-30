@@ -445,7 +445,8 @@ def list_videos(request: Request, directory: str = Query("."), recursive: bool =
         {"path": str(p), "name": p.name, "size": p.stat().st_size} for p in slice_v
     ]
     if detail:
-        for info, p in zip(videos_out, slice_v):
+        for i, info in enumerate(videos_out):
+            p = slice_v[i]
             # tags
             tfile = index.artifact_dir(p) / f"{p.stem}.tags.json"
             if tfile.exists():
