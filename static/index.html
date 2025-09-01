@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Video Router Demo</title>
+  <script src="app.js"></script>
+</head>
+<body>
+  <nav>
+    <a href="#/">Home</a>
+  </nav>
+  <ul id="video-links"></ul>
+  <div id="view"></div>
+  <script>
+    const router = new Router('view');
+    router
+      .register('/', () => {
+        document.getElementById('view').textContent = 'Welcome home';
+      })
+      .register('/videos/:id', ({id}) => {
+        document.getElementById('view').textContent = `Viewing video ${id}`;
+      });
+
+    const videos = ['alpha', 'beta', 'gamma'];
+    const list = document.getElementById('video-links');
+    videos.forEach(id => {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = `#/videos/${encodeURIComponent(id)}`;
+      a.textContent = `Video ${id}`;
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+  </script>
+</body>
+</html>

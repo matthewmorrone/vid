@@ -154,14 +154,22 @@ def build_artifact_info(path: Path) -> Dict[str, Dict[str, Any]]:
     """Return artifact paths/URLs alongside existence flags."""
     s, j = index.sprite_sheet_paths(path)
     subs_path = index.artifact_dir(path) / f"{path.stem}.srt"
+    thumb_artifact = index.thumbs_path(path)
+    # Some callers/tests may store thumbnails alongside the video rather than
+    # inside the artifact directory. In that case fall back to <video>.jpg next
+    # to the source file.
+    thumb_fallback = path.with_suffix(".jpg")
+    thumb_exists = thumb_artifact.exists() or thumb_fallback.exists()
+    thumb_url = str(thumb_artifact if thumb_artifact.exists() else thumb_fallback)
+
     data: Dict[str, Dict[str, Any]] = {
         "metadata": {
             "url": str(index.metadata_path(path)),
             "exists": index.metadata_path(path).exists(),
         },
         "thumbs": {
-            "url": str(index.thumbs_path(path)),
-            "exists": index.thumbs_path(path).exists(),
+            "url": thumb_url,
+            "exists": thumb_exists,
         },
         "sprites": {
             "sheet": str(s),
@@ -539,10 +547,14 @@ def video_artifacts(name: str, directory: str = Query(".")):
     if not path.exists():
         raise HTTPException(404, "video not found")
     s, j = index.sprite_sheet_paths(path)
+    thumb_artifact = index.thumbs_path(path)
+    thumb_fallback = path.with_suffix(".jpg")
+    thumbs_exist = thumb_artifact.exists() or thumb_fallback.exists()
+
     return {
         "video": name,
         "metadata": index.metadata_path(path).exists(),
-    "thumbs": index.thumbs_path(path).exists(),
+        "thumbs": thumbs_exist,
         "sprites": s.exists() and j.exists(),
         "previews": index.preview_index_path(path).exists(),
         "subtitles": index.find_subtitles(path) is not None,
