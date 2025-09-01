@@ -9,7 +9,15 @@
   <nav>
     <a href="#/">Home</a>
   </nav>
-  <ul id="video-links"></ul>
+  <div id="settings">
+    <label><input type="checkbox" id="infiniteToggle"> Infinite scroll</label>
+  </div>
+  <table id="video-table"></table>
+  <div id="pagination">
+    <button id="prev-page">Prev</button>
+    <span id="page-info"></span>
+    <button id="next-page">Next</button>
+  </div>
   <div id="view"></div>
   <script>
     const router = new Router('view');
@@ -20,17 +28,7 @@
       .register('/videos/:id', ({id}) => {
         document.getElementById('view').textContent = `Viewing video ${id}`;
       });
-
-    const videos = ['alpha', 'beta', 'gamma'];
-    const list = document.getElementById('video-links');
-    videos.forEach(id => {
-      const li = document.createElement('li');
-      const a = document.createElement('a');
-      a.href = `#/videos/${encodeURIComponent(id)}`;
-      a.textContent = `Video ${id}`;
-      li.appendChild(a);
-      list.appendChild(li);
-    });
+    // Listing is initiated by app.js on load
   </script>
 </body>
 </html>
