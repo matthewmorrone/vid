@@ -106,9 +106,26 @@ async function listVideos(params = {}) {
   url.searchParams.set('offset', offset);
   url.searchParams.set('limit', limit);
   url.searchParams.set('detail', '1');
-  const resp = await fetch(url.toString());
-  if (!resp.ok) throw new Error('Failed to load videos');
-  return resp.json();
+
+  const controller = new AbortController();
+  const timeoutMs = 10000; // 10 seconds timeout
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url.toString(), { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (!resp.ok) throw new Error('Failed to load videos');
+    return resp.json();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out while loading videos');
+    } else if (err instanceof TypeError) {
+      throw new Error('Network error while loading videos');
+    } else {
+      throw err;
+    }
+  }
 }
 
 function sortVideos(videos) {
