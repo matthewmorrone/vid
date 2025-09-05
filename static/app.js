@@ -103,6 +103,149 @@ function detachPlayerHotkeys() {
 }
 
 // ---------------------------------------------------------------------------
+// Settings handling
+// ---------------------------------------------------------------------------
+const DEFAULT_SETTINGS = {
+  theme: 'system',
+  paging: 'grid',
+  listPageSize: 16,
+  autoAdvance: true,
+  infiniteScroll: false,
+};
+
+function loadSettings() {
+  let stored = {};
+  try {
+    stored = JSON.parse(localStorage.getItem('settings') || '{}');
+  } catch (_) {
+    stored = {};
+  }
+  window.Settings = Object.assign({}, DEFAULT_SETTINGS, stored);
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem('settings', JSON.stringify(window.Settings));
+  } catch (_) {
+    // ignore
+  }
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  root.classList.remove('theme-dark', 'theme-light');
+  let mode = theme;
+  if (mode === 'system') {
+    mode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  if (mode === 'dark') {
+    root.classList.add('theme-dark');
+  } else {
+    root.classList.add('theme-light');
+  }
+}
+
+loadSettings();
+applyTheme(window.Settings.theme);
+
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const handle = () => {
+    if (window.Settings.theme === 'system') applyTheme('system');
+  };
+  if (mq.addEventListener) mq.addEventListener('change', handle); else if (mq.addListener) mq.addListener(handle);
+}
+
+function renderSettings(options = {}) {
+  detachPlayerHotkeys();
+  const { containerId = 'view' } = options;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const settings = window.Settings;
+
+  container.innerHTML = '';
+
+  function addSection(labelText, input) {
+    const label = document.createElement('label');
+    label.textContent = labelText + ' ';
+    label.appendChild(input);
+    const wrap = document.createElement('div');
+    wrap.appendChild(label);
+    container.appendChild(wrap);
+  }
+
+  const themeSel = document.createElement('select');
+  [
+    { value: 'system', text: 'System' },
+    { value: 'light', text: 'Light' },
+    { value: 'dark', text: 'Dark' },
+  ].forEach(opt => {
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.text;
+    themeSel.appendChild(o);
+  });
+  themeSel.value = settings.theme;
+  themeSel.addEventListener('change', () => {
+    settings.theme = themeSel.value;
+    saveSettings();
+    applyTheme(settings.theme);
+  });
+  addSection('Theme:', themeSel);
+
+  const pagingSel = document.createElement('select');
+  [
+    { value: 'grid', text: 'Grid' },
+    { value: 'list', text: 'List' },
+  ].forEach(opt => {
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.text;
+    pagingSel.appendChild(o);
+  });
+  pagingSel.value = settings.paging;
+  pagingSel.addEventListener('change', () => {
+    settings.paging = pagingSel.value;
+    saveSettings();
+  });
+  addSection('Paging mode:', pagingSel);
+
+  const sizeInput = document.createElement('input');
+  sizeInput.type = 'number';
+  sizeInput.min = '1';
+  sizeInput.value = settings.listPageSize;
+  sizeInput.addEventListener('change', () => {
+    const v = parseInt(sizeInput.value, 10);
+    if (!isNaN(v) && v > 0) {
+      settings.listPageSize = v;
+      saveSettings();
+    }
+  });
+  addSection('List page size:', sizeInput);
+
+  const autoChk = document.createElement('input');
+  autoChk.type = 'checkbox';
+  autoChk.checked = !!settings.autoAdvance;
+  autoChk.addEventListener('change', () => {
+    settings.autoAdvance = autoChk.checked;
+    saveSettings();
+  });
+  addSection('Auto-advance:', autoChk);
+
+  const resetBtn = document.createElement('button');
+  resetBtn.textContent = 'Reset to defaults';
+  resetBtn.addEventListener('click', () => {
+    Object.assign(settings, DEFAULT_SETTINGS);
+    saveSettings();
+    applyTheme(settings.theme);
+    renderSettings(options);
+  });
+  container.appendChild(resetBtn);
+}
+
+window.renderSettings = renderSettings;
+
+// ---------------------------------------------------------------------------
 // Grid rendering helper
 // ---------------------------------------------------------------------------
 // Options: { containerId: 'content', limit: 50, sort: 'date_added desc', ...filters }
@@ -258,9 +401,10 @@ window.renderGrid = renderGrid;
 // optional infinite scrolling (controlled by a global `Settings` object).
 async function renderList(options = {}) {
   detachPlayerHotkeys();
+  const settings = window.Settings || {};
   const {
     containerId = 'content',
-    limit = 16,
+    limit = settings.listPageSize || 16,
     sort = 'title asc',
     ...filters
   } = options;
@@ -276,7 +420,6 @@ async function renderList(options = {}) {
   sortDir = sortDir || 'asc';
 
   // Respect global Settings toggle if present
-  const settings = window.Settings || {};
   let useInfinite = settings.infiniteScroll === undefined ? false : !!settings.infiniteScroll;
 
   container.innerHTML = '';
@@ -478,6 +621,7 @@ async function renderList(options = {}) {
   toggle.addEventListener('change', () => {
     useInfinite = toggle.checked;
     settings.infiniteScroll = useInfinite;
+    saveSettings();
     offset = 0;
     tbody.innerHTML = '';
     fetchPage(true);
@@ -504,6 +648,7 @@ async function renderPlayer(name, options = {}) {
 
   container.innerHTML = '';
   let currentName = name;
+  const settings = window.Settings || {};
 
   // Fetch detail/metadata for subtitles and scenes
   let detail = {};
@@ -615,24 +760,26 @@ async function renderPlayer(name, options = {}) {
   window.addEventListener('keydown', keyHandler);
 
   // Auto-advance: fetch only the next video name when needed
-  video.addEventListener('ended', async () => {
-    try {
-      const resp = await fetch(`/videos/next?current=${encodeURIComponent(currentName)}`);
-      if (resp.ok) {
-        const data = await resp.json();
-        const next = data.next;
-        if (next) {
-          if (window.router instanceof Router) {
-            window.router.navigate(`/video/${encodeURIComponent(next)}`);
-          } else {
-            renderPlayer(next, { autoplay: true });
+  if (settings.autoAdvance !== false) {
+    video.addEventListener('ended', async () => {
+      try {
+        const resp = await fetch(`/videos/next?current=${encodeURIComponent(currentName)}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          const next = data.next;
+          if (next) {
+            if (window.router instanceof Router) {
+              window.router.navigate(`/video/${encodeURIComponent(next)}`);
+            } else {
+              renderPlayer(next, { autoplay: true });
+            }
           }
         }
+      } catch (_) {
+        // ignore
       }
-    } catch (_) {
-      // ignore
-    }
-  });
+    });
+  }
 
   let tagData = { tags: [], performers: [], description: '' };
   try {
