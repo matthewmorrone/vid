@@ -590,8 +590,8 @@ def get_video_tags(name: str, directory: str = Query(".")):
         return {"video": name, "tags": [], "performers": [], "description": ""}
     try:
         data = json.loads(tfile.read_text())
-    except Exception:
-        raise HTTPException(500, "invalid tags file")
+    except Exception as e:
+        raise HTTPException(500, "invalid tags file") from e
     if "description" not in data:
         data["description"] = ""
     return data
