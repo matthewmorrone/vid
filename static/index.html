@@ -7,7 +7,7 @@
 </head>
 <body>
   <nav>
-    <a href="#/">Home</a>
+    <a href="/" id="nav-home">Home</a>
   </nav>
   <div id="view"></div>
   <script>
@@ -17,9 +17,13 @@
       .register('/', () => {
         renderGrid({ containerId: 'view' });
       })
-      .register('/player/:name', ({ name }) => {
-        renderPlayer(name);
+      .register('/video/:name', ({ name }) => {
+        renderPlayer(name, { autoplay: true });
       });
+    document.getElementById('nav-home').addEventListener('click', e => {
+      e.preventDefault();
+      router.navigate('/');
+    });
 
     // Example static navigation; real app would query the API
     const videos = ['alpha', 'beta', 'gamma'];
@@ -27,8 +31,13 @@
     videos.forEach(name => {
       const li = document.createElement('li');
       const a = document.createElement('a');
-      a.href = `#/player/${encodeURIComponent(name)}`;
+      const href = `/video/${encodeURIComponent(name)}`;
+      a.href = href;
       a.textContent = `Video ${name}`;
+      a.addEventListener('click', ev => {
+        ev.preventDefault();
+        router.navigate(href);
+      });
       li.appendChild(a);
       list.appendChild(li);
     });

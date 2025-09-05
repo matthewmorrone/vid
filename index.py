@@ -235,7 +235,7 @@ def rename_with_artifacts(src: Path, dst: Path) -> None:
     if not src.exists():
         raise FileNotFoundError(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(src, dst)
+    os.rename(src, dst)
     src_dir = src.parent / ARTIFACTS_DIR
     if not src_dir.exists():
         return
@@ -244,7 +244,7 @@ def rename_with_artifacts(src: Path, dst: Path) -> None:
     for p in src_dir.iterdir():
         if p.name.startswith(src.stem):
             new_name = dst.stem + p.name[len(src.stem):]
-            os.replace(p, dst_dir / new_name)
+            os.rename(p, dst_dir / new_name)
 
 def find_videos(root: Path, recursive: bool = False, exts: set[str] | None = None) -> List[Path]:
     exts = exts or {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
