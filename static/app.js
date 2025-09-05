@@ -24,6 +24,15 @@ class Router {
     return this;
   }
 
+  // Optional programmatic navigation helper
+  navigate(path) {
+    if (!path.startsWith('#')) {
+      window.location.hash = path;
+    } else {
+      window.location.hash = path.slice(1);
+    }
+  }
+
   // Find the first matching route for the current hash and dispatch.
   handle() {
     const fragment = window.location.hash.slice(1) || '/';
@@ -130,8 +139,12 @@ async function renderGrid(options = {}) {
         const overlay = createOverlay();
         tile.appendChild(overlay);
         tile.addEventListener('click', () => {
-          const target = `/player?video=${encodeURIComponent(v.name)}`;
-          window.location.href = target;
+          const target = `/player/${encodeURIComponent(v.name)}`;
+          if (window.router instanceof Router) {
+            window.router.navigate(target);
+          } else {
+            window.location.hash = target;
+          }
         });
 
         container.appendChild(tile);
@@ -155,3 +168,26 @@ async function renderGrid(options = {}) {
 }
 
 window.renderGrid = renderGrid;
+
+// ---------------------------------------------------------------------------
+// Simple player renderer
+// ---------------------------------------------------------------------------
+function renderPlayer(name, options = {}) {
+  const { containerId = 'view' } = options;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  // Reset view and create basic player element
+  container.innerHTML = '';
+  const title = document.createElement('h2');
+  title.textContent = name;
+  container.appendChild(title);
+
+  const video = document.createElement('video');
+  video.controls = true;
+  // Assume the server can serve raw video at this path
+  video.src = `/videos/${encodeURIComponent(name)}`;
+  container.appendChild(video);
+}
+
+window.renderPlayer = renderPlayer;
