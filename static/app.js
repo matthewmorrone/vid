@@ -574,7 +574,7 @@ async function renderPlayer(name, options = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ new_name: newName }),
       });
-      if (!resp.ok) throw new Error('bad');
+      if (!resp.ok) throw new Error('Failed to rename video');
       currentName = newName;
       video.src = `/videos/${encodeURIComponent(newName)}`;
       field.value = newName;
