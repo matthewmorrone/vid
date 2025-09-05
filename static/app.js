@@ -83,6 +83,16 @@ async function renderGrid(options = {}) {
     const overlay = document.createElement('div');
     overlay.className = 'play-overlay';
     overlay.textContent = '▶';
+    // Basic inline styles so the icon sits centered and hidden by default.
+    overlay.style.position = 'absolute';
+    overlay.style.top = '50%';
+    overlay.style.left = '50%';
+    overlay.style.transform = 'translate(-50%, -50%)';
+    overlay.style.fontSize = '2rem';
+    overlay.style.color = 'white';
+    overlay.style.pointerEvents = 'none';
+    overlay.style.opacity = '0';
+    overlay.style.transition = 'opacity 0.2s';
     return overlay;
   }
 
@@ -107,6 +117,8 @@ async function renderGrid(options = {}) {
       videos.forEach(v => {
         const tile = document.createElement('div');
         tile.className = 'grid-item';
+        tile.tabIndex = 0; // allow keyboard focus
+        tile.style.position = 'relative';
 
         // Base thumbnail
         const img = document.createElement('img');
@@ -116,35 +128,55 @@ async function renderGrid(options = {}) {
         tile.appendChild(img);
 
         // Hover preview (if preview clip exists)
+        let vid = null;
         if (v.artifacts && v.artifacts.previews && v.artifacts.previews.exists) {
-          const vid = document.createElement('video');
+          vid = document.createElement('video');
           vid.src = v.artifacts.previews.url;
           vid.muted = true;
           vid.loop = true;
           vid.style.display = 'none';
           tile.appendChild(vid);
-          tile.addEventListener('mouseenter', () => {
-            img.style.display = 'none';
-            vid.style.display = 'block';
-            vid.play().catch(() => {});
-          });
-          tile.addEventListener('mouseleave', () => {
-            vid.pause();
-            vid.style.display = 'none';
-            img.style.display = 'block';
-          });
         }
 
         // Play overlay
         const overlay = createOverlay();
         tile.appendChild(overlay);
-        tile.addEventListener('click', () => {
+
+        // Hover handlers for preview/overlay
+        const handleEnter = () => {
+          overlay.style.opacity = '1';
+          if (vid) {
+            img.style.display = 'none';
+            vid.style.display = 'block';
+            vid.play().catch(() => {});
+          }
+        };
+        const handleLeave = () => {
+          overlay.style.opacity = '0';
+          if (vid) {
+            vid.pause();
+            vid.style.display = 'none';
+            img.style.display = 'block';
+          }
+        };
+        tile.addEventListener('mouseenter', handleEnter);
+        tile.addEventListener('mouseleave', handleLeave);
+        tile.addEventListener('focus', handleEnter);
+        tile.addEventListener('blur', handleLeave);
+
+        const navigate = () => {
           const target = `/player/${encodeURIComponent(v.name)}`;
           if (window.router instanceof Router) {
             window.router.navigate(target);
           } else {
             window.location.hash = target;
           }
+        };
+
+        tile.addEventListener('click', navigate);
+        tile.addEventListener('dblclick', navigate);
+        tile.addEventListener('keydown', e => {
+          if (e.key === 'Enter') navigate();
         });
 
         container.appendChild(tile);
@@ -156,15 +188,17 @@ async function renderGrid(options = {}) {
 
   async function onScroll() {
     if (done || loading) return;
-    const scrollBottom = window.innerHeight + window.scrollY;
-    // Trigger when within 200px of document bottom
-    if (scrollBottom >= document.body.offsetHeight - 200) {
+    // Trigger when within 200px of container bottom
+    const { bottom } = container.getBoundingClientRect();
+    if (bottom - window.innerHeight < 200) {
       await appendBatch();
     }
   }
 
   window.addEventListener('scroll', onScroll);
   await appendBatch();
+  // In case initial content doesn't fill viewport, attempt another batch.
+  await onScroll();
 }
 
 window.renderGrid = renderGrid;
