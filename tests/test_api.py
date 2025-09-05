@@ -186,6 +186,21 @@ def test_api_tags_endpoints(tmp_path, monkeypatch):
         assert not_mod.status_code == 304
 
 
+def test_api_rename_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"00")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    (art_dir / "a.ffprobe.json").write_text("{}")
+    with TestClient(api.app) as client:
+        r = client.post(f"/videos/{vid.name}/rename", params={"directory": str(tmp_path)}, json={"new_name": "b.mp4"})
+        assert r.status_code == 200
+        assert (tmp_path / "b.mp4").exists()
+        assert (art_dir / "b.ffprobe.json").exists()
+        assert not vid.exists()
+
+
     def test_api_cancel_metadata_job(tmp_path, monkeypatch):
         monkeypatch.setenv("FFPROBE_DISABLE", "1")
         # Create many stub videos to keep job busy long enough to cancel
