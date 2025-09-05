@@ -658,10 +658,10 @@ def rename_video(name: str, payload: RenameRequest, directory: str = Query("."))
         raise HTTPException(409, "destination exists")
     try:
         index.rename_with_artifacts(src, dst)
-    except FileNotFoundError:
-        raise HTTPException(404, "video not found")
-    except Exception:
-        raise HTTPException(500, "rename failed")
+    except FileNotFoundError as e:
+        raise HTTPException(404, "video not found") from e
+    except Exception as e:
+        raise HTTPException(500, "rename failed") from e
     return {"old_name": name, "new_name": payload.new_name}
 
 @app.get("/videos/{name}")
