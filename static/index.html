@@ -9,6 +9,7 @@
   <nav>
     <a href="/" id="nav-home">Home</a>
     <a href="/report" id="nav-report">Artifacts</a>
+    <a href="/settings" id="nav-settings">Settings</a>
   </nav>
   <div id="view"></div>
   <script>
@@ -16,13 +17,20 @@
     window.router = new Router('view');
     router
       .register('/', () => {
-        renderGrid({ containerId: 'view' });
+        if (window.Settings && window.Settings.paging === 'list') {
+          renderList({ containerId: 'view' });
+        } else {
+          renderGrid({ containerId: 'view' });
+        }
       })
       .register('/video/:name', ({ name }) => {
         renderPlayer(name, { autoplay: true });
       })
       .register('/report', () => {
         renderReport({ containerId: 'view' });
+      })
+      .register('/settings', () => {
+        renderSettings({ containerId: 'view' });
       });
     document.getElementById('nav-home').addEventListener('click', e => {
       e.preventDefault();
@@ -31,6 +39,10 @@
     document.getElementById('nav-report').addEventListener('click', e => {
       e.preventDefault();
       router.navigate('/report');
+    });
+    document.getElementById('nav-settings').addEventListener('click', e => {
+      e.preventDefault();
+      router.navigate('/settings');
     });
 
     // Example static navigation; real app would query the API
