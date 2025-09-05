@@ -766,7 +766,7 @@ async function renderPlayer(name, options = {}) {
         const resp = await fetch(`/videos/next?current=${encodeURIComponent(currentName)}`);
         if (resp.ok) {
           const data = await resp.json();
-          const next = data.next;
+          const {next} = data;
           if (next) {
             if (window.router instanceof Router) {
               window.router.navigate(`/video/${encodeURIComponent(next)}`);
