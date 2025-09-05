@@ -513,14 +513,6 @@ async function renderPlayer(name, options = {}) {
   } catch (_) {
     // ignore
   }
-  let metadata = null;
-  try {
-    const m = await fetch(`/videos/${encodeURIComponent(currentName)}/metadata`);
-    if (m.ok) metadata = await m.json();
-  } catch (_) {
-    // ignore
-  }
-
   const titleInput = document.createElement('input');
   titleInput.type = 'text';
   titleInput.value = currentName;
