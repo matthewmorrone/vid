@@ -744,3 +744,161 @@ async function renderPlayer(name, options = {}) {
 }
 
 window.renderPlayer = renderPlayer;
+
+// ---------------------------------------------------------------------------
+// Artifact coverage dashboard & job management
+// ---------------------------------------------------------------------------
+
+const MAX_CONCURRENT_JOBS = 4;
+const _activeJobs = new Map();
+
+function _artifactTask(key) {
+  return key === 'faces' ? 'embed' : key;
+}
+
+async function renderReport(opts = {}) {
+  detachPlayerHotkeys();
+  const { containerId = 'view', directory = '.', recursive = false } = opts;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.textContent = 'Loading...';
+  try {
+    const resp = await fetch(`/report?directory=${encodeURIComponent(directory)}&recursive=${recursive ? 1 : 0}`);
+    if (!resp.ok) throw new Error('failed');
+    const data = await resp.json();
+    container.textContent = '';
+    const grid = document.createElement('div');
+    grid.style.display = 'flex';
+    grid.style.flexWrap = 'wrap';
+    grid.style.gap = '10px';
+    const total = data.total || 0;
+    const counts = data.counts || {};
+    const coverage = data.coverage || {};
+    Object.keys(counts).forEach(key => {
+      const card = document.createElement('div');
+      card.style.border = '1px solid #ccc';
+      card.style.padding = '8px';
+      card.style.width = '180px';
+      const h = document.createElement('h3');
+      h.textContent = key;
+      h.style.margin = '0 0 4px 0';
+      const pct = ((coverage[key] || 0) * 100).toFixed(1);
+      const p = document.createElement('p');
+      p.textContent = `${counts[key]}/${total} (${pct}%)`;
+      p.style.margin = '0 0 6px 0';
+      card.appendChild(h);
+      card.appendChild(p);
+      const btn = document.createElement('button');
+      btn.textContent = 'Generate Missing';
+      if (coverage[key] >= 1) btn.disabled = true;
+      btn.addEventListener('click', () => _startJobForArtifact(key, card, btn));
+      card.appendChild(btn);
+      grid.appendChild(card);
+    });
+    container.appendChild(grid);
+  } catch (err) {
+    container.textContent = 'Failed to load';
+  }
+}
+
+async function _startJobForArtifact(key, card, button) {
+  if (_activeJobs.size >= MAX_CONCURRENT_JOBS) {
+    showToast('Maximum 4 concurrent jobs');
+    return;
+  }
+  const task = _artifactTask(key);
+  button.disabled = true;
+  try {
+    const resp = await fetch('/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task, directory: '.', recursive: false, force: false })
+    });
+    if (!resp.ok) throw new Error('submit failed');
+    const job = await resp.json();
+    _trackJob(job, card, button);
+  } catch (err) {
+    button.disabled = false;
+    showToast('Job submission failed');
+  }
+}
+
+function _trackJob(job, card, button) {
+  const progress = document.createElement('progress');
+  progress.max = job.progress_total || 1;
+  progress.value = job.progress_current || 0;
+  progress.style.display = 'block';
+  progress.style.width = '100%';
+  card.appendChild(progress);
+
+  const status = document.createElement('span');
+  status.textContent = job.status;
+  status.className = 'job-status';
+  card.appendChild(status);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.style.marginLeft = '8px';
+  cancelBtn.addEventListener('click', () => _cancelJob(job.id, cancelBtn));
+  card.appendChild(cancelBtn);
+
+  let pollTimer = null;
+  _activeJobs.set(job.id, { progress, status, cancelBtn, button });
+
+  const es = new EventSource(`/jobs/${job.id}/events`);
+
+  function update(d) {
+    progress.max = d.progress_total || 1;
+    progress.value = d.progress_current || 0;
+    status.textContent = d.status;
+    if (['done', 'error', 'canceled'].includes(d.status)) {
+      cleanup();
+      renderReport();
+    }
+  }
+
+  function cleanup() {
+    if (pollTimer) clearInterval(pollTimer);
+    es.onerror = null;
+    try { es.close(); } catch (e) {}
+    cancelBtn.remove();
+    progress.remove();
+    status.remove();
+    button.disabled = false;
+    _activeJobs.delete(job.id);
+  }
+
+  es.addEventListener('progress', ev => {
+    const d = JSON.parse(ev.data);
+    update(d);
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) return;
+    es.close();
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      try {
+        const resp = await fetch(`/jobs/${job.id}`);
+        if (!resp.ok) throw new Error('gone');
+        const d = await resp.json();
+        update(d);
+        if (['done', 'error', 'canceled'].includes(d.status)) {
+          clearInterval(pollTimer);
+        }
+      } catch (err) {
+        clearInterval(pollTimer);
+      }
+    }, 1000);
+  };
+}
+
+async function _cancelJob(id, btn) {
+  btn.disabled = true;
+  try {
+    await fetch(`/jobs/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    // ignore
+  }
+}
+
+window.renderReport = renderReport;
