@@ -3,7 +3,8 @@ class Router {
     this.root = document.getElementById(rootId);
     this.routes = [];
     this.handle = this.handle.bind(this);
-    window.addEventListener('hashchange', this.handle);
+    // Use popstate for history navigation and initial load for deep links.
+    window.addEventListener('popstate', this.handle);
     window.addEventListener('load', this.handle);
   }
 
@@ -26,16 +27,16 @@ class Router {
 
   // Optional programmatic navigation helper
   navigate(path) {
-    if (!path.startsWith('#')) {
-      window.location.hash = path;
-    } else {
-      window.location.hash = path.slice(1);
+    // Use History API so URLs like /video/name are navigable and shareable.
+    if (path !== window.location.pathname) {
+      window.history.pushState({}, '', path);
+      this.handle();
     }
   }
 
-  // Find the first matching route for the current hash and dispatch.
+  // Find the first matching route for the current path and dispatch.
   handle() {
-    const fragment = window.location.hash.slice(1) || '/';
+    const fragment = window.location.pathname || '/';
     for (const route of this.routes) {
       const match = fragment.match(route.regex);
       if (match) {
@@ -94,6 +95,13 @@ function showToast(message, { duration = 3000, actionText, onAction } = {}) {
   return toast;
 }
 
+function detachPlayerHotkeys() {
+  if (window.__playerKeyHandler) {
+    window.removeEventListener('keydown', window.__playerKeyHandler);
+    window.__playerKeyHandler = null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Grid rendering helper
 // ---------------------------------------------------------------------------
@@ -102,6 +110,7 @@ function showToast(message, { duration = 3000, actionText, onAction } = {}) {
 // does not yet implement filtering or sort, but query parameters are always
 // sent so future backend features can hook in without client changes.
 async function renderGrid(options = {}) {
+  detachPlayerHotkeys();
   const {
     containerId = 'content',
     limit = 50,
@@ -203,19 +212,19 @@ async function renderGrid(options = {}) {
         tile.addEventListener('blur', handleLeave);
 
         const navigate = () => {
-          const target = `/player/${encodeURIComponent(v.name)}`;
+          const target = `/video/${encodeURIComponent(v.name)}`;
           if (window.router instanceof Router) {
             window.router.navigate(target);
           } else {
-            window.location.hash = target;
+            window.location.pathname = target;
           }
         };
 
-        tile.addEventListener('click', navigate);
-        tile.addEventListener('dblclick', navigate);
-        tile.addEventListener('keydown', e => {
-          if (e.key === 'Enter') navigate();
-        });
+          tile.addEventListener('click', navigate);
+          tile.addEventListener('dblclick', navigate);
+          tile.addEventListener('keydown', e => {
+            if (e.key === 'Enter') navigate();
+          });
 
         container.appendChild(tile);
       });
@@ -248,6 +257,7 @@ window.renderGrid = renderGrid;
 // Fetches batches from `/videos` and renders a table. Supports pagination or
 // optional infinite scrolling (controlled by a global `Settings` object).
 async function renderList(options = {}) {
+  detachPlayerHotkeys();
   const {
     containerId = 'content',
     limit = 16,
@@ -417,9 +427,17 @@ async function renderList(options = {}) {
         const tr = document.createElement('tr');
         const tdTitle = document.createElement('td');
         const a = document.createElement('a');
-        a.href = `#/player/${encodeURIComponent(v.name)}`;
-        a.textContent = v.name;
-        tdTitle.appendChild(a);
+          a.href = `/video/${encodeURIComponent(v.name)}`;
+          a.textContent = v.name;
+          a.addEventListener('click', e => {
+            e.preventDefault();
+            if (window.router instanceof Router) {
+              window.router.navigate(a.getAttribute('href'));
+            } else {
+              window.location.pathname = a.getAttribute('href');
+            }
+          });
+          tdTitle.appendChild(a);
         tr.appendChild(tdTitle);
         const tdDur = document.createElement('td');
         tdDur.textContent = formatDuration(v.duration);
@@ -478,12 +496,30 @@ window.renderList = renderList;
 // Simple player renderer
 // ---------------------------------------------------------------------------
 async function renderPlayer(name, options = {}) {
-  const { containerId = 'view' } = options;
+  const { containerId = 'view', autoplay = false } = options;
   const container = document.getElementById(containerId);
   if (!container) return;
 
+  detachPlayerHotkeys();
+
   container.innerHTML = '';
   let currentName = name;
+
+  // Fetch detail/metadata for subtitles and scenes
+  let detail = {};
+  try {
+    const r = await fetch(`/videos/${encodeURIComponent(currentName)}`);
+    if (r.ok) detail = await r.json();
+  } catch (_) {
+    // ignore
+  }
+  let metadata = null;
+  try {
+    const m = await fetch(`/videos/${encodeURIComponent(currentName)}/metadata`);
+    if (m.ok) metadata = await m.json();
+  } catch (_) {
+    // ignore
+  }
 
   const titleInput = document.createElement('input');
   titleInput.type = 'text';
@@ -493,7 +529,122 @@ async function renderPlayer(name, options = {}) {
   const video = document.createElement('video');
   video.controls = true;
   video.src = `/videos/${encodeURIComponent(currentName)}`;
+  video.setAttribute('playsinline', '');
+  video.autoplay = autoplay;
   container.appendChild(video);
+
+  // Subtitles
+  if (detail.artifacts && detail.artifacts.subtitles && detail.artifacts.subtitles.exists) {
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.src = detail.artifacts.subtitles.url;
+    track.default = true;
+    video.appendChild(track);
+  }
+
+  // Scene tick marks container
+  const tickBar = document.createElement('div');
+  tickBar.style.position = 'relative';
+  tickBar.style.height = '4px';
+  tickBar.style.background = '#444';
+  tickBar.style.marginTop = '4px';
+  container.appendChild(tickBar);
+
+  let sceneMarkers = [];
+  try {
+    if (detail.artifacts && detail.artifacts.scenes && detail.artifacts.scenes.exists) {
+      const sc = await fetch(detail.artifacts.scenes.url);
+      if (sc.ok) {
+        const scj = await sc.json();
+        sceneMarkers = scj.markers || [];
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  function renderTicks() {
+    if (!sceneMarkers.length || !video.duration) return;
+    tickBar.innerHTML = '';
+    sceneMarkers.forEach(m => {
+      const tk = document.createElement('div');
+      tk.style.position = 'absolute';
+      tk.style.left = `${(m.time / video.duration) * 100}%`;
+      tk.style.width = '2px';
+      tk.style.height = '100%';
+      tk.style.background = '#fff';
+      tickBar.appendChild(tk);
+    });
+  }
+
+  if (sceneMarkers.length) {
+    if (video.readyState >= 1) {
+      renderTicks();
+    } else {
+      video.addEventListener('loadedmetadata', renderTicks);
+    }
+  }
+
+  if (autoplay) {
+    video.addEventListener('canplay', () => {
+      video.play().catch(() => {});
+    }, { once: true });
+  }
+
+  const keyHandler = e => {
+    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    switch (e.key) {
+      case ' ':
+      case 'k':
+        e.preventDefault();
+        if (video.paused) video.play(); else video.pause();
+        break;
+      case 'j':
+        video.currentTime = Math.max(0, video.currentTime - 10);
+        break;
+      case 'l':
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+        break;
+      case 'ArrowLeft':
+        video.currentTime = Math.max(0, video.currentTime - 5);
+        break;
+      case 'ArrowRight':
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 5);
+        break;
+      case 'ArrowUp':
+        video.volume = Math.min(1, video.volume + 0.1);
+        break;
+      case 'ArrowDown':
+        video.volume = Math.max(0, video.volume - 0.1);
+        break;
+    }
+  };
+  window.__playerKeyHandler = keyHandler;
+  window.addEventListener('keydown', keyHandler);
+
+  // Auto-advance
+  let videoList = [];
+  try {
+    const lr = await fetch('/videos?limit=1000');
+    if (lr.ok) {
+      const ld = await lr.json();
+      videoList = (ld.videos || []).map(v => v.name);
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  video.addEventListener('ended', () => {
+    const idx = videoList.indexOf(currentName);
+    if (idx >= 0 && idx < videoList.length - 1) {
+      const next = videoList[idx + 1];
+      if (window.router instanceof Router) {
+        window.router.navigate(`/video/${encodeURIComponent(next)}`);
+      } else {
+        renderPlayer(next, { autoplay: true });
+      }
+    }
+  });
 
   let tagData = { tags: [], performers: [], description: '' };
   try {
