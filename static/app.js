@@ -595,7 +595,12 @@ async function renderPlayer(name, options = {}) {
   titleInput.addEventListener('blur', () => {
     const newName = titleInput.value.trim();
     if (!newName || (titleInput.dataset.retry !== '1' && newName === currentName)) return;
-    renameVideo(currentName, newName, titleInput);
+    if (newName !== currentName) {
+      const confirmed = window.confirm('Are you sure you want to rename the video?');
+      if (confirmed) {
+        renameVideo(currentName, newName, titleInput);
+      }
+    }
   });
 }
 
