@@ -9,28 +9,30 @@
   <nav>
     <a href="#/">Home</a>
   </nav>
-  <ul id="video-links"></ul>
   <div id="view"></div>
   <script>
-    const router = new Router('view');
+    // Expose router globally so helpers can navigate
+    window.router = new Router('view');
     router
       .register('/', () => {
-        document.getElementById('view').textContent = 'Welcome home';
+        renderGrid({ containerId: 'view' });
       })
-      .register('/videos/:id', ({id}) => {
-        document.getElementById('view').textContent = `Viewing video ${id}`;
+      .register('/player/:name', ({ name }) => {
+        renderPlayer(name);
       });
 
+    // Example static navigation; real app would query the API
     const videos = ['alpha', 'beta', 'gamma'];
-    const list = document.getElementById('video-links');
-    videos.forEach(id => {
+    const list = document.createElement('ul');
+    videos.forEach(name => {
       const li = document.createElement('li');
       const a = document.createElement('a');
-      a.href = `#/videos/${encodeURIComponent(id)}`;
-      a.textContent = `Video ${id}`;
+      a.href = `#/player/${encodeURIComponent(name)}`;
+      a.textContent = `Video ${name}`;
       li.appendChild(a);
       list.appendChild(li);
     });
+    document.body.insertBefore(list, document.getElementById('view'));
   </script>
 </body>
 </html>
