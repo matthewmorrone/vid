@@ -214,11 +214,18 @@ function renderSettings(options = {}) {
   sizeInput.type = 'number';
   sizeInput.min = '1';
   sizeInput.value = settings.listPageSize;
+  let prevValidPageSize = settings.listPageSize;
+
   sizeInput.addEventListener('change', () => {
     const v = parseInt(sizeInput.value, 10);
     if (!isNaN(v) && v > 0) {
       settings.listPageSize = v;
+      prevValidPageSize = v;
       saveSettings();
+    } else {
+      alert('Please enter a valid page size (number greater than 0).');
+      sizeInput.value = prevValidPageSize;
+    }
     }
   });
   addSection('List page size:', sizeInput);
