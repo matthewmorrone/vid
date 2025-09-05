@@ -3,19 +3,6 @@
 <head>
   <meta charset="utf-8" />
   <title>Video Router Demo</title>
-  <script>
-    (function() {
-      try {
-        var s = JSON.parse(localStorage.getItem('settings') || '{}');
-        var t = s.theme || 'system';
-        var mode = t;
-        if (mode === 'system') {
-          mode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-        }
-        document.documentElement.classList.add(mode === 'dark' ? 'theme-dark' : 'theme-light');
-      } catch (e) {}
-    })();
-  </script>
   <script src="app.js"></script>
 </head>
 <body>
