@@ -654,6 +654,11 @@ def rename_video(name: str, payload: RenameRequest, directory: str = Query("."))
     dst = root / payload.new_name
     if not src.exists():
         raise HTTPException(404, "video not found")
+    # Case-insensitive collision check
+    lower_new_name = payload.new_name.lower()
+    for entry in root.iterdir():
+        if entry.is_file() and entry.name.lower() == lower_new_name and entry != src:
+            raise HTTPException(409, "destination exists (case-insensitive collision)")
     if dst.exists():
         raise HTTPException(409, "destination exists")
     try:
