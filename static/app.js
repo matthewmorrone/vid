@@ -56,6 +56,44 @@ class Router {
 
 window.Router = Router;
 
+// Simple toast helper
+function showToast(message, { duration = 3000, actionText, onAction } = {}) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.style.position = 'fixed';
+    container.style.bottom = '10px';
+    container.style.right = '10px';
+    container.style.zIndex = '1000';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.textContent = message;
+  toast.style.background = 'rgba(0,0,0,0.7)';
+  toast.style.color = 'white';
+  toast.style.padding = '8px 12px';
+  toast.style.marginTop = '5px';
+  toast.style.borderRadius = '4px';
+  if (actionText && typeof onAction === 'function') {
+    const btn = document.createElement('button');
+    btn.textContent = actionText;
+    btn.style.marginLeft = '8px';
+    btn.addEventListener('click', () => {
+      onAction();
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    });
+    toast.appendChild(btn);
+  }
+  container.appendChild(toast);
+  if (duration > 0) {
+    setTimeout(() => {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, duration);
+  }
+  return toast;
+}
+
 // ---------------------------------------------------------------------------
 // Grid rendering helper
 // ---------------------------------------------------------------------------
@@ -439,22 +477,131 @@ window.renderList = renderList;
 // ---------------------------------------------------------------------------
 // Simple player renderer
 // ---------------------------------------------------------------------------
-function renderPlayer(name, options = {}) {
+async function renderPlayer(name, options = {}) {
   const { containerId = 'view' } = options;
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  // Reset view and create basic player element
   container.innerHTML = '';
-  const title = document.createElement('h2');
-  title.textContent = name;
-  container.appendChild(title);
+  let currentName = name;
+
+  const titleInput = document.createElement('input');
+  titleInput.type = 'text';
+  titleInput.value = currentName;
+  container.appendChild(titleInput);
 
   const video = document.createElement('video');
   video.controls = true;
-  // Assume the server can serve raw video at this path
-  video.src = `/videos/${encodeURIComponent(name)}`;
+  video.src = `/videos/${encodeURIComponent(currentName)}`;
   container.appendChild(video);
+
+  let tagData = { tags: [], performers: [], description: '' };
+  try {
+    const resp = await fetch(`/videos/${encodeURIComponent(currentName)}/tags`);
+    if (resp.ok) {
+      const d = await resp.json();
+      tagData = {
+        tags: d.tags || [],
+        performers: d.performers || [],
+        description: d.description || '',
+      };
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  const descInput = document.createElement('textarea');
+  descInput.value = tagData.description || '';
+  container.appendChild(descInput);
+
+  const tagsInput = document.createElement('input');
+  tagsInput.type = 'text';
+  tagsInput.value = (tagData.tags || []).join(', ');
+  container.appendChild(tagsInput);
+
+  const perfInput = document.createElement('input');
+  perfInput.type = 'text';
+  perfInput.value = (tagData.performers || []).join(', ');
+  container.appendChild(perfInput);
+
+  function splitList(str) {
+    return str.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  async function patchTags(payload, field) {
+    try {
+      const resp = await fetch(`/videos/${encodeURIComponent(currentName)}/tags`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) throw new Error('bad');
+      field.dataset.retry = '';
+      return true;
+    } catch (err) {
+      field.dataset.retry = '1';
+      showToast('Update failed');
+      return false;
+    }
+  }
+
+  descInput.addEventListener('blur', async () => {
+    const val = descInput.value;
+    if (descInput.dataset.retry !== '1' && val === tagData.description) return;
+    const ok = await patchTags({ description: val }, descInput);
+    if (ok) tagData.description = val;
+  });
+
+  tagsInput.addEventListener('blur', async () => {
+    const newTags = splitList(tagsInput.value);
+    if (tagsInput.dataset.retry !== '1' && newTags.join(',') === (tagData.tags || []).join(',')) return;
+    const ok = await patchTags({ replace: true, add: newTags }, tagsInput);
+    if (ok) tagData.tags = newTags;
+  });
+
+  perfInput.addEventListener('blur', async () => {
+    const newPerfs = splitList(perfInput.value);
+    if (perfInput.dataset.retry !== '1' && newPerfs.join(',') === (tagData.performers || []).join(',')) return;
+    const payload = { performers_remove: tagData.performers, performers_add: newPerfs };
+    const ok = await patchTags(payload, perfInput);
+    if (ok) tagData.performers = newPerfs;
+  });
+
+  async function renameVideo(oldName, newName, field) {
+    try {
+      const resp = await fetch(`/videos/${encodeURIComponent(oldName)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_name: newName }),
+      });
+      if (!resp.ok) throw new Error('Failed to rename video');
+      currentName = newName;
+      video.src = `/videos/${encodeURIComponent(newName)}`;
+      field.value = newName;
+      field.dataset.retry = '';
+      showToast(`Renamed to ${newName}`, {
+        duration: 10000,
+        actionText: 'Undo',
+        onAction: () => renameVideo(newName, oldName, field),
+      });
+      return true;
+    } catch (err) {
+      field.dataset.retry = '1';
+      showToast('Rename failed');
+      return false;
+    }
+  }
+
+  titleInput.addEventListener('blur', () => {
+    const newName = titleInput.value.trim();
+    if (!newName || (titleInput.dataset.retry !== '1' && newName === currentName)) return;
+    if (newName !== currentName) {
+      const confirmed = window.confirm('Are you sure you want to rename the video?');
+      if (confirmed) {
+        renameVideo(currentName, newName, titleInput);
+      }
+    }
+  });
 }
 
 window.renderPlayer = renderPlayer;

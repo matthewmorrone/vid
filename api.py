@@ -587,11 +587,14 @@ def get_video_tags(name: str, directory: str = Query(".")):
         raise HTTPException(404, "video not found")
     tfile = index.artifact_dir(path) / f"{path.stem}.tags.json"
     if not tfile.exists():
-        return {"video": name, "tags": [], "performers": []}
+        return {"video": name, "tags": [], "performers": [], "description": ""}
     try:
-        return json.loads(tfile.read_text())
-    except Exception:
-        raise HTTPException(500, "invalid tags file")
+        data = json.loads(tfile.read_text())
+    except Exception as e:
+        raise HTTPException(500, "invalid tags file") from e
+    if "description" not in data:
+        data["description"] = ""
+    return data
 
 class TagUpdate(BaseModel):
     add: list[str] | None = None
@@ -599,6 +602,7 @@ class TagUpdate(BaseModel):
     performers_add: list[str] | None = None
     performers_remove: list[str] | None = None
     replace: bool = False
+    description: str | None = None
 
 @app.patch("/videos/{name}/tags")
 def update_video_tags(name: str, payload: TagUpdate, directory: str = Query(".")):
@@ -611,9 +615,10 @@ def update_video_tags(name: str, payload: TagUpdate, directory: str = Query(".")
         try:
             data = json.loads(tfile.read_text())
         except Exception:
-            data = {"video": name, "tags": [], "performers": []}
+            data = {"video": name, "tags": [], "performers": [], "description": ""}
     else:
-        data = {"video": name, "tags": [], "performers": []}
+        data = {"video": name, "tags": [], "performers": [], "description": ""}
+    data.setdefault("description", "")
     if payload.replace and payload.add is not None:
         data["tags"] = []
     if payload.add:
@@ -628,12 +633,41 @@ def update_video_tags(name: str, payload: TagUpdate, directory: str = Query(".")
                 data["performers"].append(t)
     if payload.performers_remove:
         data["performers"] = [t for t in data["performers"] if t not in payload.performers_remove]
+    if payload.description is not None:
+        data["description"] = payload.description
     # Write back
     try:
         tfile.write_text(json.dumps(data, indent=2))
     except Exception:
         raise HTTPException(500, "failed to write tags")
     return data
+
+
+class RenameRequest(BaseModel):
+    new_name: str
+
+
+@app.post("/videos/{name}/rename")
+def rename_video(name: str, payload: RenameRequest, directory: str = Query(".")):
+    root = Path(directory).expanduser().resolve()
+    src = root / name
+    dst = root / payload.new_name
+    if not src.exists():
+        raise HTTPException(404, "video not found")
+    # Case-insensitive collision check
+    lower_new_name = payload.new_name.lower()
+    for entry in root.iterdir():
+        if entry.is_file() and entry.name.lower() == lower_new_name and entry != src:
+            raise HTTPException(409, "destination exists (case-insensitive collision)")
+    if dst.exists():
+        raise HTTPException(409, "destination exists")
+    try:
+        index.rename_with_artifacts(src, dst)
+    except FileNotFoundError as e:
+        raise HTTPException(404, "video not found") from e
+    except Exception as e:
+        raise HTTPException(500, "rename failed") from e
+    return {"old_name": name, "new_name": payload.new_name}
 
 @app.get("/videos/{name}")
 def video_detail(name: str, directory: str = Query(".")):
@@ -652,12 +686,15 @@ def video_detail(name: str, directory: str = Query(".")):
             tdata = json.loads(tfile.read_text())
             info["tags"] = tdata.get("tags", [])
             info["performers"] = tdata.get("performers", [])
+            info["description"] = tdata.get("description", "")
         except Exception:
             info["tags"] = []
             info["performers"] = []
+            info["description"] = ""
     else:
         info["tags"] = []
         info["performers"] = []
+        info["description"] = ""
     # Duration/codecs via summary cache (single-file mode)
     try:
         summaries = index.load_metadata_summary(root, recursive=False)
@@ -711,6 +748,7 @@ def import_tags(payload: BulkImport, directory: str = Query(".")):
                 "video": name,
                 "tags": entry.get("tags", []),
                 "performers": entry.get("performers", []),
+                "description": entry.get("description", ""),
             }, indent=2))
             written += 1
         except Exception:

@@ -186,6 +186,65 @@ def test_api_tags_endpoints(tmp_path, monkeypatch):
         assert not_mod.status_code == 304
 
 
+def test_api_rename_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"00")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    (art_dir / "a.ffprobe.json").write_text("{}")
+    with TestClient(api.app) as client:
+        r = client.post(f"/videos/{vid.name}/rename", params={"directory": str(tmp_path)}, json={"new_name": "b.mp4"})
+        assert r.status_code == 200
+        assert (tmp_path / "b.mp4").exists()
+        assert (art_dir / "b.ffprobe.json").exists()
+        assert not vid.exists()
+
+def test_api_rename_nonexistent_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    with TestClient(api.app) as client:
+        r = client.post(f"/videos/nonexistent.mp4/rename", params={"directory": str(tmp_path)}, json={"new_name": "b.mp4"})
+        assert r.status_code == 404
+
+def test_api_rename_to_existing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    vid1 = tmp_path / "a.mp4"
+    vid2 = tmp_path / "b.mp4"
+    vid1.write_bytes(b"00")
+    vid2.write_bytes(b"11")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    (art_dir / "a.ffprobe.json").write_text("{}")
+    (art_dir / "b.ffprobe.json").write_text("{}")
+    with TestClient(api.app) as client:
+        r = client.post(f"/videos/{vid1.name}/rename", params={"directory": str(tmp_path)}, json={"new_name": "b.mp4"})
+        assert r.status_code == 409
+
+def test_api_rename_unexpected_exception(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"00")
+    art_dir = tmp_path / ".artifacts"
+    art_dir.mkdir()
+    (art_dir / "a.ffprobe.json").write_text("{}")
+
+    # Monkeypatch os.rename to raise an exception
+    import os
+    original_rename = os.rename
+    def raise_exception(*args, **kwargs):
+        raise RuntimeError("Unexpected error")
+    monkeypatch.setattr(os, "rename", raise_exception)
+
+    with TestClient(api.app) as client:
+        r = client.post(f"/videos/{vid.name}/rename", params={"directory": str(tmp_path)}, json={"new_name": "b.mp4"})
+        assert r.status_code == 500
+
+    # Restore original os.rename
+    monkeypatch.setattr(os, "rename", original_rename)
+
+
     def test_api_cancel_metadata_job(tmp_path, monkeypatch):
         monkeypatch.setenv("FFPROBE_DISABLE", "1")
         # Create many stub videos to keep job busy long enough to cancel
