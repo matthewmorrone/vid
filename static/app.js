@@ -614,27 +614,23 @@ async function renderPlayer(name, options = {}) {
   window.__playerKeyHandler = keyHandler;
   window.addEventListener('keydown', keyHandler);
 
-  // Auto-advance
-  let videoList = [];
-  try {
-    const lr = await fetch('/videos?limit=1000');
-    if (lr.ok) {
-      const ld = await lr.json();
-      videoList = (ld.videos || []).map(v => v.name);
-    }
-  } catch (_) {
-    // ignore
-  }
-
-  video.addEventListener('ended', () => {
-    const idx = videoList.indexOf(currentName);
-    if (idx >= 0 && idx < videoList.length - 1) {
-      const next = videoList[idx + 1];
-      if (window.router instanceof Router) {
-        window.router.navigate(`/video/${encodeURIComponent(next)}`);
-      } else {
-        renderPlayer(next, { autoplay: true });
+  // Auto-advance: fetch only the next video name when needed
+  video.addEventListener('ended', async () => {
+    try {
+      const resp = await fetch(`/videos/next?current=${encodeURIComponent(currentName)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const next = data.next;
+        if (next) {
+          if (window.router instanceof Router) {
+            window.router.navigate(`/video/${encodeURIComponent(next)}`);
+          } else {
+            renderPlayer(next, { autoplay: true });
+          }
+        }
       }
+    } catch (_) {
+      // ignore
     }
   });
 
