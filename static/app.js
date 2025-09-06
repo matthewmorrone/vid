@@ -118,7 +118,16 @@ function openSidebar(video) {
     sidebar.style.padding = '10px';
     document.body.appendChild(sidebar);
   }
-  sidebar.innerHTML = `<h3>${video.name}</h3>`;
+  sidebar.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <h3 style="margin: 0;">${video.name}</h3>
+      <button id="sidebar-close-btn" style="background: transparent; color: white; border: none; font-size: 1.5em; cursor: pointer;">&times;</button>
+    </div>
+  `;
+  const closeBtn = sidebar.querySelector('#sidebar-close-btn');
+  closeBtn.addEventListener('click', () => {
+    sidebar.remove();
+  });
 }
 
 window.openSidebar = openSidebar;
