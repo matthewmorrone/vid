@@ -194,7 +194,7 @@ async function openSidebar(video) {
   sidebar.appendChild(perfLabel);
 
   function splitList(str) {
-    return str.split(',').map(s => s.trim()).filter(Boolean);
+    return (str || '').split(',').map(s => s.trim()).filter(Boolean);
   }
 
   async function patchTags(payload, field) {
