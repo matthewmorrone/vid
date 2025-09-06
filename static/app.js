@@ -102,6 +102,27 @@ function detachPlayerHotkeys() {
   }
 }
 
+function openSidebar(video) {
+  let sidebar = document.getElementById('sidebar');
+  if (!sidebar) {
+    sidebar = document.createElement('div');
+    sidebar.id = 'sidebar';
+    sidebar.style.position = 'fixed';
+    sidebar.style.top = '0';
+    sidebar.style.right = '0';
+    sidebar.style.width = '300px';
+    sidebar.style.height = '100%';
+    sidebar.style.background = 'rgba(0,0,0,0.8)';
+    sidebar.style.color = 'white';
+    sidebar.style.overflow = 'auto';
+    sidebar.style.padding = '10px';
+    document.body.appendChild(sidebar);
+  }
+  sidebar.innerHTML = `<h3>${video.name}</h3>`;
+}
+
+window.openSidebar = openSidebar;
+
 // ---------------------------------------------------------------------------
 // Settings handling
 // ---------------------------------------------------------------------------
@@ -275,6 +296,10 @@ async function renderGrid(options = {}) {
   let loading = false;
   let done = false;
 
+  const sentinel = document.createElement('div');
+  container.appendChild(sentinel);
+  let observer;
+
   // Create play overlay element for a tile
   function createOverlay() {
     const overlay = document.createElement('div');
@@ -370,32 +395,35 @@ async function renderGrid(options = {}) {
           }
         };
 
-          tile.addEventListener('click', navigate);
-          tile.addEventListener('dblclick', navigate);
-          tile.addEventListener('keydown', e => {
-            if (e.key === 'Enter') navigate();
-          });
+        tile.addEventListener('click', () => openSidebar(v));
+        tile.addEventListener('dblclick', navigate);
+        tile.addEventListener('keydown', e => {
+          if (e.key === 'Enter') navigate();
+        });
 
-        container.appendChild(tile);
+        container.insertBefore(tile, sentinel);
       });
+      if (videos.length < limit) {
+        done = true;
+        if (observer) observer.disconnect();
+        sentinel.remove();
+      }
     } finally {
       loading = false;
     }
   }
 
-  async function onScroll() {
-    if (done || loading) return;
-    // Trigger when within 200px of container bottom
-    const { bottom } = container.getBoundingClientRect();
-    if (bottom - window.innerHeight < 200) {
+  observer = new IntersectionObserver(async entries => {
+    if (entries.some(e => e.isIntersecting)) {
       await appendBatch();
     }
-  }
+  }, { root: null, rootMargin: '200px' });
+  observer.observe(sentinel);
 
-  window.addEventListener('scroll', onScroll);
   await appendBatch();
-  // In case initial content doesn't fill viewport, attempt another batch.
-  await onScroll();
+  while (!done && sentinel.getBoundingClientRect().top <= window.innerHeight + 200) {
+    await appendBatch();
+  }
 }
 
 window.renderGrid = renderGrid;
