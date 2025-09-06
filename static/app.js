@@ -582,7 +582,17 @@ async function renderList(options = {}) {
       if (v !== undefined && v !== null && v !== '') params.append(k, v);
     });
     const resp = await fetch(`/videos?${params.toString()}`);
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      tbody.innerHTML = '';
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 8; // Assuming 8 columns in the table
+      td.style.color = 'red';
+      td.textContent = `Error loading videos: ${resp.status} ${resp.statusText}`;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
     const data = await resp.json();
     const videos = data.videos || [];
     const total = data.count || data.total || 0;
