@@ -157,8 +157,14 @@ async function openSidebar(video) {
         description: d.description || '',
       };
     }
-  } catch (_) {
-    // ignore fetch errors
+  } catch (err) {
+    console.error('Failed to fetch tags for video:', currentName, err);
+    // Optionally show UI feedback
+    const errorMsg = document.createElement('div');
+    errorMsg.textContent = 'Failed to load tags for this video.';
+    errorMsg.style.color = 'red';
+    errorMsg.style.marginBottom = '10px';
+    sidebar.insertBefore(errorMsg, sidebar.firstChild);
   }
 
   const descLabel = document.createElement('label');
