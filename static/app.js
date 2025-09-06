@@ -421,9 +421,14 @@ async function renderGrid(options = {}) {
   observer.observe(sentinel);
 
   await appendBatch();
-  while (!done && sentinel.getBoundingClientRect().top <= window.innerHeight + 200) {
-    await appendBatch();
+  // Instead of a synchronous while loop, use a non-blocking batch loader.
+  async function loadBatches() {
+    if (!done && sentinel.getBoundingClientRect().top <= window.innerHeight + 200) {
+      await appendBatch();
+      setTimeout(loadBatches, 0); // Yield control to the browser between batches
+    }
   }
+  loadBatches();
 }
 
 window.renderGrid = renderGrid;
