@@ -541,6 +541,10 @@ async function renderList(options = {}) {
   const getCodec = v => v.codec || v.vcodec || '';
 
   function renderPager(total) {
+    if (total === 0) {
+      pager.innerHTML = '';
+      return;
+    }
     const totalPages = Math.max(1, Math.ceil(total / limit));
     pager.innerHTML = '';
     const prev = document.createElement('button');
