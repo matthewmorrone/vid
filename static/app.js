@@ -573,7 +573,6 @@ async function renderList(options = {}) {
       limit: String(limit),
       page: String(currentPage),
       sort: `${sortKey} ${sortDir}`,
-      offset: String((currentPage - 1) * limit),
     });
     Object.entries(filters).forEach(([k, v]) => {
       if (v !== undefined && v !== null && v !== '') params.append(k, v);
