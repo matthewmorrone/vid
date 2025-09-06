@@ -204,7 +204,7 @@ async function openSidebar(video) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!resp.ok) throw new Error('bad');
+      if (!resp.ok) throw new Error('Failed to update tags');
       field.dataset.retry = '';
       return true;
     } catch (err) {
