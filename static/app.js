@@ -445,9 +445,8 @@ window.renderGrid = renderGrid;
 // ---------------------------------------------------------------------------
 // List rendering helper
 // ---------------------------------------------------------------------------
-// Options: { containerId: 'content', limit: 16, sort: 'title asc', ...filters }
-// Fetches batches from `/videos` and renders a table. Supports pagination or
-// optional infinite scrolling (controlled by a global `Settings` object).
+// Fetches `/videos` with limit and page parameters and renders a sortable,
+// paginated table.
 async function renderList(options = {}) {
   detachPlayerHotkeys();
   const settings = window.Settings || {};
@@ -455,49 +454,31 @@ async function renderList(options = {}) {
     containerId = 'content',
     limit = settings.listPageSize || 16,
     sort = 'title asc',
+    page = 1,
     ...filters
   } = options;
 
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  // State
-  let offset = 0;
-  let total = 0;
-  let loading = false;
+  container.innerHTML = '';
+
+  let currentPage = page;
   let [sortKey, sortDir] = sort.split(/\s+/);
   sortDir = sortDir || 'asc';
 
-  // Respect global Settings toggle if present
-  let useInfinite = settings.infiniteScroll === undefined ? false : !!settings.infiniteScroll;
-
-  container.innerHTML = '';
-
-  // Toggle for infinite scroll
-  const toggleWrap = document.createElement('div');
-  const toggle = document.createElement('input');
-  toggle.type = 'checkbox';
-  toggle.id = 'list-inf-toggle';
-  toggle.checked = useInfinite;
-  const toggleLabel = document.createElement('label');
-  toggleLabel.htmlFor = 'list-inf-toggle';
-  toggleLabel.textContent = 'Infinite scroll';
-  toggleWrap.appendChild(toggle);
-  toggleWrap.appendChild(toggleLabel);
-  container.appendChild(toggleWrap);
-
-  // Table skeleton
   const table = document.createElement('table');
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
   const columns = [
     { key: 'title', label: 'Title' },
     { key: 'duration', label: 'Duration' },
-    { key: 'size', label: 'Size' },
-    { key: 'vcodec', label: 'Video' },
-    { key: 'acodec', label: 'Audio' },
+    { key: 'resolution', label: 'Resolution' },
+    { key: 'date_added', label: 'Date Added' },
+    { key: 'plays', label: 'Plays' },
+    { key: 'codec', label: 'Codec' },
+    { key: 'size', label: 'File Size' },
   ];
-
   columns.forEach(col => {
     const th = document.createElement('th');
     th.textContent = col.label;
@@ -509,47 +490,20 @@ async function renderList(options = {}) {
         sortKey = col.key;
         sortDir = 'asc';
       }
-      offset = 0;
-      tbody.innerHTML = '';
-      fetchPage(true);
+      currentPage = 1;
+      load();
     });
     headRow.appendChild(th);
   });
-
   thead.appendChild(headRow);
   table.appendChild(thead);
   const tbody = document.createElement('tbody');
   table.appendChild(tbody);
   container.appendChild(table);
 
-  // Pagination controls
   const pager = document.createElement('div');
-  const prevBtn = document.createElement('button');
-  prevBtn.textContent = 'Prev';
-  const nextBtn = document.createElement('button');
-  nextBtn.textContent = 'Next';
-  pager.appendChild(prevBtn);
-  pager.appendChild(nextBtn);
+  pager.className = 'pager';
   container.appendChild(pager);
-
-  prevBtn.addEventListener('click', () => {
-    if (offset >= limit) {
-      offset -= limit;
-      fetchPage(true);
-    }
-  });
-  nextBtn.addEventListener('click', () => {
-    if (offset + limit < total) {
-      offset += limit;
-      fetchPage(true);
-    }
-  });
-
-  function updatePager() {
-    pager.style.display = useInfinite ? 'none' : 'block';
-    prevBtn.disabled = offset <= 0;
-    nextBtn.disabled = offset + limit >= total;
-  }
 
   function formatSize(bytes) {
     if (bytes == null) return '';
@@ -573,118 +527,114 @@ async function renderList(options = {}) {
     return parts.join(':');
   }
 
-  function getVal(v, key) {
-    switch (key) {
-      case 'title':
-        return v.name?.toLowerCase();
-      default:
-        return v[key];
-    }
-  }
+  const formatDate = str => {
+    if (!str) return '';
+    const d = new Date(str);
+    return isNaN(d.getTime()) ? '' : d.toLocaleString();
+  };
 
-  function sortLocal(arr) {
-    arr.sort((a, b) => {
-      const va = getVal(a, sortKey);
-      const vb = getVal(b, sortKey);
-      if (va == null && vb == null) return 0;
-      if (va == null) return 1;
-      if (vb == null) return -1;
-      if (va < vb) return sortDir === 'asc' ? -1 : 1;
-      if (va > vb) return sortDir === 'asc' ? 1 : -1;
-      return 0;
+  const getResolution = v => {
+    if (v.width != null && v.height != null) return `${v.width}x${v.height}`;
+    return v.resolution || '';
+  };
+
+  const getCodec = v => v.codec || v.vcodec || '';
+
+  function renderPager(total) {
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    pager.innerHTML = '';
+    const prev = document.createElement('button');
+    prev.textContent = 'Prev';
+    prev.disabled = currentPage <= 1;
+    prev.addEventListener('click', () => {
+      if (currentPage > 1) {
+        currentPage -= 1;
+        load();
+      }
     });
+    const next = document.createElement('button');
+    next.textContent = 'Next';
+    next.disabled = currentPage >= totalPages;
+    next.addEventListener('click', () => {
+      if (currentPage < totalPages) {
+        currentPage += 1;
+        load();
+      }
+    });
+    const info = document.createElement('span');
+    info.textContent = ` Page ${currentPage} of ${totalPages} `;
+    pager.appendChild(prev);
+    pager.appendChild(info);
+    pager.appendChild(next);
   }
 
-  async function fetchPage(reset = false) {
-    if (loading) return;
-    loading = true;
+  async function load() {
     const params = new URLSearchParams({
-      offset: String(offset),
       limit: String(limit),
+      page: String(currentPage),
       sort: `${sortKey} ${sortDir}`,
-      detail: 'true',
+      offset: String((currentPage - 1) * limit),
     });
     Object.entries(filters).forEach(([k, v]) => {
       if (v !== undefined && v !== null && v !== '') params.append(k, v);
     });
-    try {
-      const resp = await fetch(`/videos?${params.toString()}`);
-      if (!resp.ok) return;
-      const data = await resp.json();
-      total = data.count || data.total || 0;
-      let vids = data.videos || [];
-      sortLocal(vids);
-      if (reset) tbody.innerHTML = '';
-      vids.forEach(v => {
-        const tr = document.createElement('tr');
-        const tdTitle = document.createElement('td');
-        const a = document.createElement('a');
-          a.href = `/video/${encodeURIComponent(v.name)}`;
-          a.textContent = v.name;
-          a.addEventListener('click', e => {
-            e.preventDefault();
-            if (window.router instanceof Router) {
-              window.router.navigate(a.getAttribute('href'));
-            } else {
-              window.location.pathname = a.getAttribute('href');
-            }
-          });
-          tdTitle.appendChild(a);
-        tr.appendChild(tdTitle);
-        const tdDur = document.createElement('td');
-        tdDur.textContent = formatDuration(v.duration);
-        tr.appendChild(tdDur);
-        const tdSize = document.createElement('td');
-        tdSize.textContent = formatSize(v.size);
-        tr.appendChild(tdSize);
-        const tdV = document.createElement('td');
-        tdV.textContent = v.vcodec || '';
-        tr.appendChild(tdV);
-        const tdA = document.createElement('td');
-        tdA.textContent = v.acodec || '';
-        tr.appendChild(tdA);
-        tbody.appendChild(tr);
-      });
-      if (useInfinite) {
-        offset += vids.length;
-      }
-    } finally {
-      loading = false;
-      updatePager();
-    }
-  }
-
-  function onScroll() {
-    if (!useInfinite || loading || offset >= total) return;
-    const { bottom } = table.getBoundingClientRect();
-    if (bottom - window.innerHeight < 200) {
-      fetchPage(false);
-    }
-  }
-
-  function applyScroll() {
-    window.removeEventListener('scroll', onScroll);
-    if (useInfinite) window.addEventListener('scroll', onScroll);
-  }
-
-  toggle.addEventListener('change', () => {
-    useInfinite = toggle.checked;
-    settings.infiniteScroll = useInfinite;
-    saveSettings();
-    offset = 0;
+    const resp = await fetch(`/videos?${params.toString()}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const videos = data.videos || [];
+    const total = data.count || data.total || 0;
     tbody.innerHTML = '';
-    fetchPage(true);
-    applyScroll();
-    updatePager();
-  });
+    videos.forEach(v => {
+      const tr = document.createElement('tr');
+      const titleTd = document.createElement('td');
+      const link = document.createElement('a');
+      const name = v.name || v.title;
+      link.href = `/video/${encodeURIComponent(name)}`;
+      link.textContent = name;
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        if (window.router instanceof Router) {
+          window.router.navigate(link.getAttribute('href'));
+        } else {
+          window.location.pathname = link.getAttribute('href');
+        }
+      });
+      titleTd.appendChild(link);
+      tr.appendChild(titleTd);
 
-  applyScroll();
-  await fetchPage(true);
-  if (useInfinite) onScroll();
+      const durTd = document.createElement('td');
+      durTd.textContent = formatDuration(v.duration);
+      tr.appendChild(durTd);
+
+      const resTd = document.createElement('td');
+      resTd.textContent = getResolution(v);
+      tr.appendChild(resTd);
+
+      const dateTd = document.createElement('td');
+      dateTd.textContent = formatDate(v.date_added || v.created);
+      tr.appendChild(dateTd);
+
+      const playsTd = document.createElement('td');
+      playsTd.textContent = v.plays != null ? v.plays : '';
+      tr.appendChild(playsTd);
+
+      const codecTd = document.createElement('td');
+      codecTd.textContent = getCodec(v);
+      tr.appendChild(codecTd);
+
+      const sizeTd = document.createElement('td');
+      sizeTd.textContent = formatSize(v.size);
+      tr.appendChild(sizeTd);
+
+      tbody.appendChild(tr);
+    });
+    renderPager(total);
+  }
+
+  await load();
 }
 
 window.renderList = renderList;
-
 // ---------------------------------------------------------------------------
 // Simple player renderer
 // ---------------------------------------------------------------------------
