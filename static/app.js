@@ -851,12 +851,12 @@ async function renderPlayer(name, options = {}) {
   video.autoplay = autoplay;
   container.appendChild(video);
 
-  // Resume playback if previously watched for >30s.
+  // Resume playback if previously watched.
   const resumeKey = `resume_${currentName}`;
   video.addEventListener('loadedmetadata', () => {
     try {
       const t = parseFloat(localStorage.getItem(resumeKey) || '0');
-      if (!isNaN(t) && t > 30 && t < video.duration - 5) {
+      if (!isNaN(t) && t > 0 && t < video.duration - 5) {
         video.currentTime = t;
       }
     } catch (_) {
