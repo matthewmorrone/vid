@@ -1373,3 +1373,43 @@ async function _cancelJob(id, btn) {
 }
 
 window.renderReport = renderReport;
+
+// ---------------------------------------------------------------------------
+// Random video navigation
+// ---------------------------------------------------------------------------
+
+async function renderRandom(opts = {}) {
+  // Attempt to fetch a random video name from the server and navigate to it.
+  // If the returned file is missing, show a toast and try again.
+  try {
+    const resp = await fetch('/videos/random');
+    if (!resp || !resp.ok) throw new Error('failed');
+    const data = await resp.json();
+    const name = data && (data.name || data.video || data.filename);
+    if (!name) throw new Error('no name');
+
+    try {
+      const head = await fetch(`/videos/${encodeURIComponent(name)}`, { method: 'HEAD' });
+      if (!head.ok) {
+        showToast(`Missing file: ${name}`);
+        renderRandom(opts);
+        return;
+      }
+    } catch (e) {
+      showToast(`Missing file: ${name}`);
+      renderRandom(opts);
+      return;
+    }
+
+    if (window.router instanceof Router) {
+      window.router.navigate(`/video/${encodeURIComponent(name)}`);
+    } else {
+      renderPlayer(name, { autoplay: true });
+    }
+  } catch (err) {
+    console.error('Failed to fetch random video', err);
+    showToast('Failed to fetch random video');
+  }
+}
+
+window.renderRandom = renderRandom;
