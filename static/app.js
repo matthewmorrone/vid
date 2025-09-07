@@ -1385,7 +1385,8 @@ async function renderRandom(opts = {}) {
     const resp = await fetch('/videos/random');
     if (!resp || !resp.ok) throw new Error('failed');
     const data = await resp.json();
-    const name = data && (data.name || data.video || data.filename);
+    // The API is expected to return { name: string }
+    const name = data && data.name;
     if (!name) throw new Error('no name');
 
     try {
