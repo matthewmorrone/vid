@@ -970,8 +970,10 @@ async function renderPlayer(name, options = {}) {
     if (!state || !Array.isArray(state.order) || state.order.length === 0) return;
     let nextName = null;
     if (mode === 'random') {
-      nextName = state.order[Math.floor(Math.random() * state.order.length)];
-    } else {
+      const candidates = state.order.filter(name => name !== currentName);
+      if (candidates.length > 0) {
+        nextName = candidates[Math.floor(Math.random() * candidates.length)];
+      }
       const idx = state.order.indexOf(currentName);
       if (idx >= 0 && idx + 1 < state.order.length) {
         nextName = state.order[idx + 1];
