@@ -1118,7 +1118,17 @@ async function renderStats(opts = {}) {
       fetch('/stats/metrics'),
       fetch(`/stats/chart_data?bucket=${encodeURIComponent(bucket)}`),
     ]);
-    if (!metricsResp.ok || !chartsResp.ok) throw new Error('failed');
+    if (!metricsResp.ok || !chartsResp.ok) {
+      let errorMsg = 'Failed to load stats:';
+      if (!metricsResp.ok) {
+        errorMsg += ` metrics API (${metricsResp.url}) returned status ${metricsResp.status}`;
+      }
+      if (!chartsResp.ok) {
+        if (!metricsResp.ok) errorMsg += ';';
+        errorMsg += ` chart_data API (${chartsResp.url}) returned status ${chartsResp.status}`;
+      }
+      throw new Error(errorMsg);
+    }
     const metrics = await metricsResp.json();
     const charts = await chartsResp.json();
     container.textContent = '';
