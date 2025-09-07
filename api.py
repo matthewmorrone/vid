@@ -31,6 +31,8 @@ import uuid
 import sys
 from pathlib import Path
 import argparse
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional, Callable
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Request, Response
@@ -97,7 +99,9 @@ ALLOWED_TASKS = {
     # Face pipeline (renamed / consolidated)
     "embed", "listing",
     # Codec / conversion & reporting
-    "codecs", "transcode", "report"
+    "codecs", "transcode", "report",
+    # Generic clipping of arbitrary ranges
+    "clip",
 }
 
 # In-memory face label assignments used by FaceLab
@@ -447,6 +451,54 @@ class JobExecutor(threading.Thread):
             ns.progress = False
             ns.output_format = "json"
             return index.cmd_transcode(ns)
+        if task == "clip":
+            src = Path(params.get("file", "")).expanduser().resolve()
+            ranges = params.get("ranges") or []
+            dest = Path(params.get("dest") or (src.parent / "_clips"))
+            fmt = params.get("format", "mp4")
+            dest.mkdir(parents=True, exist_ok=True)
+            out_files: list[str] = []
+            with _jobs_lock:
+                job = _jobs.get(self.job_id)
+                if job:
+                    job.progress_total = len(ranges)
+                    job.progress_current = 0
+            cancel_ev = _job_cancel_events.get(self.job_id)
+            for idx, r in enumerate(ranges):
+                if cancel_ev and cancel_ev.is_set():
+                    raise index.CanceledError()
+                start = float(r.get("start", 0))
+                end = float(r.get("end", 0))
+                outfile = dest / f"clip_{idx:03d}.{fmt}"
+                if os.environ.get("FFPROBE_DISABLE") or shutil.which("ffmpeg") is None:
+                    outfile.write_text(f"stub clip {start}-{end}")
+                else:
+                    try:
+                        subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-v",
+                                "error",
+                                "-ss",
+                                f"{start:.3f}",
+                                "-to",
+                                f"{end:.3f}",
+                                "-i",
+                                str(src),
+                                "-c",
+                                "copy",
+                                str(outfile),
+                            ],
+                            check=True,
+                        )
+                    except Exception:
+                        outfile.write_text(f"stub clip {start}-{end}")
+                out_files.append(str(outfile))
+                with _jobs_lock:
+                    job = _jobs.get(self.job_id)
+                    if job:
+                        job.progress_current = idx + 1
+            return {"files": out_files}
         raise ValueError(f"Unsupported task {task}")
 
 

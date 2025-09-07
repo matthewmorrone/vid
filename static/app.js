@@ -889,6 +889,30 @@ async function renderPlayer(name, options = {}) {
   tickBar.style.marginTop = '4px';
   container.appendChild(tickBar);
 
+  // Mini clipper state and selection overlay
+  let clipStart = null;
+  let clipEnd = null;
+  const clipSel = document.createElement('div');
+  clipSel.style.position = 'absolute';
+  clipSel.style.top = '0';
+  clipSel.style.height = '100%';
+  clipSel.style.background = 'rgba(0,255,0,0.3)';
+  clipSel.style.display = 'none';
+  tickBar.appendChild(clipSel);
+
+  function updateClipSel() {
+    if (clipStart != null && clipEnd != null && video.duration) {
+      const s = (clipStart / video.duration) * 100;
+      const e = (clipEnd / video.duration) * 100;
+      clipSel.style.display = 'block';
+      clipSel.style.left = `${s}%`;
+      clipSel.style.width = `${e - s}%`;
+    } else {
+      clipSel.style.display = 'none';
+    }
+  }
+  video.addEventListener('loadedmetadata', updateClipSel);
+
   let sceneMarkers = [];
   try {
     if (detail.artifacts && detail.artifacts.scenes && detail.artifacts.scenes.exists) {
@@ -914,6 +938,8 @@ async function renderPlayer(name, options = {}) {
       tk.style.background = '#fff';
       tickBar.appendChild(tk);
     });
+    tickBar.appendChild(clipSel);
+    updateClipSel();
   }
 
   if (sceneMarkers.length) {
@@ -929,6 +955,32 @@ async function renderPlayer(name, options = {}) {
       video.play().catch(() => {});
     }, { once: true });
   }
+
+  const clipControls = document.createElement('div');
+  clipControls.style.marginTop = '4px';
+  const inBtn = document.createElement('button');
+  inBtn.textContent = 'In';
+  inBtn.addEventListener('click', () => { clipStart = video.currentTime; updateClipSel(); });
+  const outBtn = document.createElement('button');
+  outBtn.textContent = 'Out';
+  outBtn.addEventListener('click', () => { clipEnd = video.currentTime; updateClipSel(); });
+  const openBtn = document.createElement('button');
+  openBtn.textContent = 'Clipper';
+  openBtn.addEventListener('click', () => {
+    const qs = new URLSearchParams();
+    if (clipStart != null) qs.set('start', clipStart.toFixed(3));
+    if (clipEnd != null) qs.set('end', clipEnd.toFixed(3));
+    const url = `/clipper/${encodeURIComponent(currentName)}?${qs.toString()}`;
+    if (window.router instanceof Router) {
+      window.router.navigate(url);
+    } else {
+      window.location.href = url;
+    }
+  });
+  clipControls.appendChild(inBtn);
+  clipControls.appendChild(outBtn);
+  clipControls.appendChild(openBtn);
+  container.appendChild(clipControls);
 
   const keyHandler = e => {
     if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
@@ -1294,7 +1346,7 @@ async function _startJobForArtifact(key, card, button) {
   }
 }
 
-function _trackJob(job, card, button) {
+function _trackJob(job, card, button, onComplete) {
   const progress = document.createElement('progress');
   progress.max = job.progress_total || 1;
   progress.value = job.progress_current || 0;
@@ -1324,7 +1376,11 @@ function _trackJob(job, card, button) {
     status.textContent = d.status;
     if (['done', 'error', 'canceled'].includes(d.status)) {
       cleanup();
-      renderReport();
+      if (typeof onComplete === 'function') {
+        onComplete(d);
+      } else {
+        renderReport();
+      }
     }
   }
 
@@ -1507,6 +1563,134 @@ async function renderFaceLab(opts = {}) {
 }
 
 window.renderFaceLab = renderFaceLab;
+
+// ---------------------------------------------------------------------------
+// Full clipper workspace
+// ---------------------------------------------------------------------------
+async function renderClipper(name, opts = {}) {
+  detachPlayerHotkeys();
+  const { containerId = 'view', start, end } = opts;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+
+  const video = document.createElement('video');
+  video.controls = true;
+  video.src = `/videos/${encodeURIComponent(name)}`;
+  container.appendChild(video);
+
+  const ranges = [];
+  if (start != null && end != null) {
+    ranges.push({ start, end });
+  }
+  const rangesList = document.createElement('ul');
+  container.appendChild(rangesList);
+
+  function renderRanges() {
+    rangesList.innerHTML = '';
+    ranges.forEach(r => {
+      const li = document.createElement('li');
+      li.textContent = `${r.start.toFixed(2)} - ${r.end.toFixed(2)}`;
+      rangesList.appendChild(li);
+    });
+  }
+  renderRanges();
+
+  let pendingStart = null;
+  const setStart = document.createElement('button');
+  setStart.textContent = 'Set Start';
+  setStart.addEventListener('click', () => { pendingStart = video.currentTime; });
+  const setEnd = document.createElement('button');
+  setEnd.textContent = 'Add Range';
+  setEnd.addEventListener('click', () => {
+    if (pendingStart != null) {
+      ranges.push({ start: pendingStart, end: video.currentTime });
+      pendingStart = null;
+      renderRanges();
+    }
+  });
+  container.appendChild(setStart);
+  container.appendChild(setEnd);
+
+  const destInput = document.createElement('input');
+  destInput.type = 'text';
+  destInput.placeholder = 'Destination directory';
+  destInput.style.display = 'block';
+  destInput.style.marginTop = '8px';
+  container.appendChild(destInput);
+
+  const formatSel = document.createElement('select');
+  ['mp4', 'webm'].forEach(f => {
+    const o = document.createElement('option');
+    o.value = f;
+    o.textContent = f;
+    formatSel.appendChild(o);
+  });
+  container.appendChild(formatSel);
+
+  const submitBtn = document.createElement('button');
+  submitBtn.textContent = 'Export';
+  submitBtn.style.display = 'block';
+  submitBtn.style.marginTop = '8px';
+  container.appendChild(submitBtn);
+
+  const jobCard = document.createElement('div');
+  jobCard.style.marginTop = '8px';
+  container.appendChild(jobCard);
+
+  const resultsDiv = document.createElement('div');
+  resultsDiv.style.marginTop = '8px';
+  container.appendChild(resultsDiv);
+
+  submitBtn.addEventListener('click', async () => {
+    if (_activeJobs.size >= MAX_CONCURRENT_JOBS) {
+      showToast('Maximum 4 concurrent jobs');
+      return;
+    }
+    const payload = {
+      task: 'clip',
+      directory: '.',
+      params: { file: name, ranges, dest: destInput.value || undefined, format: formatSel.value }
+    };
+    try {
+      const resp = await fetch('/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) throw new Error('submit failed');
+      const job = await resp.json();
+      _trackJob(job, jobCard, submitBtn, async () => {
+        try {
+          const r = await fetch(`/jobs/${job.id}`);
+          if (!r.ok) return;
+          const jd = await r.json();
+          const files = (jd.result && jd.result.files) || [];
+          resultsDiv.innerHTML = '';
+          files.forEach(f => {
+            const link = document.createElement('a');
+            link.href = f;
+            link.textContent = f.split('/').pop();
+            link.download = '';
+            link.style.display = 'block';
+            resultsDiv.appendChild(link);
+            const v = document.createElement('video');
+            v.controls = true;
+            v.src = f;
+            v.style.maxWidth = '100%';
+            resultsDiv.appendChild(v);
+          });
+        } catch (err) {
+          // ignore
+        }
+      });
+    } catch (err) {
+      showToast('Job submission failed');
+    }
+  });
+}
+
+window.renderClipper = renderClipper;
 
 // ---------------------------------------------------------------------------
 // Random video navigation

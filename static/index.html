@@ -43,6 +43,12 @@
       .register('/video/:name', ({ name }) => {
         renderPlayer(name, { autoplay: true });
       })
+      .register('/clipper/:name', ({ name }) => {
+        const qs = new URLSearchParams(window.location.search);
+        const s = parseFloat(qs.get('start'));
+        const e = parseFloat(qs.get('end'));
+        renderClipper(name, { containerId: 'view', start: isNaN(s) ? null : s, end: isNaN(e) ? null : e });
+      })
       .register('/stats', () => {
         renderStats({ containerId: 'view' });
       })
