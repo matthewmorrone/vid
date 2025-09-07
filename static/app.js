@@ -267,6 +267,8 @@ async function openSidebar(video) {
       const confirmed = window.confirm('Are you sure you want to rename the video?');
       if (confirmed) {
         renameVideo(currentName, newName, titleInput);
+      } else {
+        titleInput.value = currentName;
       }
     }
   });
