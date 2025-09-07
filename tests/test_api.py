@@ -143,6 +143,33 @@ def test_api_dupes_and_embed_job(tmp_path, monkeypatch):
         assert j2["result"] == 0
 
 
+def test_api_clip_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("FFPROBE_DISABLE", "1")
+    video = tmp_path / "c.mp4"
+    video.write_bytes(b"00")
+    dest = tmp_path / "out"
+    with TestClient(api.app) as client:
+        payload = {
+            "task": "clip",
+            "directory": str(tmp_path),
+            "params": {
+                "file": str(video),
+                "ranges": [{"start": 0.0, "end": 1.0}],
+                "dest": str(dest),
+            },
+        }
+        job = client.post("/jobs", json=payload).json()
+        for _ in range(30):
+            r = client.get(f"/jobs/{job['id']}").json()
+            if r["status"] == "done":
+                break
+            time.sleep(0.1)
+        assert r["status"] == "done"
+        files = r["result"]["files"]
+        assert len(files) == 1
+        assert Path(files[0]).exists()
+
+
 def test_api_invalid_task():
     with TestClient(api.app) as client:
         r = client.post("/jobs", json={"task": "not-a-task", "directory": "."})
