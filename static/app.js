@@ -902,8 +902,13 @@ async function renderPlayer(name, options = {}) {
 
   function updateClipSel() {
     if (clipStart != null && clipEnd != null && video.duration) {
-      const s = (clipStart / video.duration) * 100;
-      const e = (clipEnd / video.duration) * 100;
+      let start = clipStart;
+      let end = clipEnd;
+      if (start > end) {
+        [start, end] = [end, start];
+      }
+      const s = (start / video.duration) * 100;
+      const e = (end / video.duration) * 100;
       clipSel.style.display = 'block';
       clipSel.style.left = `${s}%`;
       clipSel.style.width = `${e - s}%`;
