@@ -283,7 +283,9 @@ const DEFAULT_SETTINGS = {
   theme: 'system',
   paging: 'grid',
   listPageSize: 16,
-  autoAdvance: true,
+  // 'next' advances sequentially, 'random' picks any loaded grid item,
+  // 'off' disables auto-advance.
+  autoAdvance: 'next',
   infiniteScroll: false,
 };
 
@@ -293,6 +295,10 @@ function loadSettings() {
     stored = JSON.parse(localStorage.getItem('settings') || '{}');
   } catch (_) {
     stored = {};
+  }
+  // Backwards compatibility: older versions stored autoAdvance as boolean.
+  if (typeof stored.autoAdvance === 'boolean') {
+    stored.autoAdvance = stored.autoAdvance ? 'next' : 'off';
   }
   window.Settings = Object.assign({}, DEFAULT_SETTINGS, stored);
 }
@@ -404,14 +410,23 @@ function renderSettings(options = {}) {
   });
   addSection('List page size:', sizeInput);
 
-  const autoChk = document.createElement('input');
-  autoChk.type = 'checkbox';
-  autoChk.checked = !!settings.autoAdvance;
-  autoChk.addEventListener('change', () => {
-    settings.autoAdvance = autoChk.checked;
+  const autoSel = document.createElement('select');
+  [
+    { value: 'next', text: 'Next' },
+    { value: 'random', text: 'Random' },
+    { value: 'off', text: 'Off' },
+  ].forEach(opt => {
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.text;
+    autoSel.appendChild(o);
+  });
+  autoSel.value = settings.autoAdvance || 'off';
+  autoSel.addEventListener('change', () => {
+    settings.autoAdvance = autoSel.value;
     saveSettings();
   });
-  addSection('Auto-advance:', autoChk);
+  addSection('Auto-advance:', autoSel);
 
   const resetBtn = document.createElement('button');
   resetBtn.textContent = 'Reset to defaults';
@@ -444,6 +459,12 @@ async function renderGrid(options = {}) {
 
   const container = document.getElementById(containerId);
   if (!container) return;
+
+  // Track current grid order and filters for auto-advance in the player.
+  window.GridState = {
+    order: [],
+    options: { sort, ...filters },
+  };
 
   let offset = 0;
   let loading = false;
@@ -490,6 +511,10 @@ async function renderGrid(options = {}) {
       if (videos.length < limit) done = true;
 
       videos.forEach(v => {
+        // Keep track of loaded video order for auto-advance logic.
+        if (window.GridState && Array.isArray(window.GridState.order)) {
+          window.GridState.order.push(v.name);
+        }
         const tile = document.createElement('div');
         tile.className = 'grid-item';
         tile.tabIndex = 0; // allow keyboard focus
@@ -826,6 +851,28 @@ async function renderPlayer(name, options = {}) {
   video.autoplay = autoplay;
   container.appendChild(video);
 
+  // Resume playback if previously watched for >30s.
+  const resumeKey = `resume_${currentName}`;
+  video.addEventListener('loadedmetadata', () => {
+    try {
+      const t = parseFloat(localStorage.getItem(resumeKey) || '0');
+      if (!isNaN(t) && t > 30 && t < video.duration - 5) {
+        video.currentTime = t;
+      }
+    } catch (_) {
+      // ignore
+    }
+  });
+  video.addEventListener('timeupdate', () => {
+    if (video.currentTime > 30 && video.currentTime < (video.duration || Infinity) - 5) {
+      try { localStorage.setItem(resumeKey, String(video.currentTime)); } catch (_) { }
+    }
+  });
+
+  function clearResume() {
+    try { localStorage.removeItem(resumeKey); } catch (_) { }
+  }
+
   // Subtitles
   if (detail.artifacts && detail.artifacts.subtitles && detail.artifacts.subtitles.exists) {
     const track = document.createElement('track');
@@ -915,27 +962,34 @@ async function renderPlayer(name, options = {}) {
   window.__playerKeyHandler = keyHandler;
   window.addEventListener('keydown', keyHandler);
 
-  // Auto-advance: fetch only the next video name when needed
-  if (settings.autoAdvance !== false) {
-    video.addEventListener('ended', async () => {
-      try {
-        const resp = await fetch(`/videos/next?current=${encodeURIComponent(currentName)}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          const {next} = data;
-          if (next) {
-            if (window.router instanceof Router) {
-              window.router.navigate(`/video/${encodeURIComponent(next)}`);
-            } else {
-              renderPlayer(next, { autoplay: true });
-            }
-          }
-        }
-      } catch (_) {
-        // ignore
+  // Auto-advance when a video ends based on settings and current grid state.
+  function autoAdvance() {
+    const mode = settings.autoAdvance;
+    if (!mode || mode === 'off') return;
+    const state = window.GridState;
+    if (!state || !Array.isArray(state.order) || state.order.length === 0) return;
+    let nextName = null;
+    if (mode === 'random') {
+      nextName = state.order[Math.floor(Math.random() * state.order.length)];
+    } else {
+      const idx = state.order.indexOf(currentName);
+      if (idx >= 0 && idx + 1 < state.order.length) {
+        nextName = state.order[idx + 1];
       }
-    });
+    }
+    if (nextName && nextName !== currentName) {
+      if (window.router instanceof Router) {
+        window.router.navigate(`/video/${encodeURIComponent(nextName)}`);
+      } else {
+        renderPlayer(nextName, { autoplay: true });
+      }
+    }
   }
+
+  video.addEventListener('ended', () => {
+    clearResume();
+    autoAdvance();
+  });
 
   let tagData = { tags: [], performers: [], description: '' };
   try {
