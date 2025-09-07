@@ -406,7 +406,6 @@ function renderSettings(options = {}) {
       alert('Please enter a valid page size (number greater than 0).');
       sizeInput.value = prevValidPageSize;
     }
-    }
   });
   addSection('List page size:', sizeInput);
 

@@ -3,6 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <title>Video Router Demo</title>
+  <script>
+    // Apply persisted theme before loading main script to avoid flash of wrong theme.
+    (function () {
+      try {
+        const settings = JSON.parse(localStorage.getItem('settings') || '{}');
+        let mode = settings.theme || 'system';
+        if (mode === 'system') {
+          mode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.classList.add(mode === 'dark' ? 'theme-dark' : 'theme-light');
+      } catch (_) {
+        console.error('Error applying theme:', _);
+      }
+    })();
+  </script>
   <script src="app.js"></script>
 </head>
 <body>
