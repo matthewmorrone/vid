@@ -88,6 +88,8 @@ _jobs: Dict[str, JobRecord] = {}
 _jobs_lock = threading.Lock()
 _canceled_jobs: set[str] = set()
 _job_cancel_events: Dict[str, threading.Event] = {}
+MAX_CONCURRENT_JOBS = 4
+_job_slots = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 
 ALLOWED_TASKS = {
     # Core artifact & analysis tasks
@@ -215,6 +217,21 @@ class JobExecutor(threading.Thread):
         self.job_id = job_id
 
     def run(self) -> None:  # noqa: D401
+        cancel_ev = _job_cancel_events.get(self.job_id)
+        # Wait for an execution slot while allowing cancellation.
+        while True:
+            if cancel_ev and cancel_ev.is_set():
+                with _jobs_lock:
+                    job = _jobs.get(self.job_id)
+                    if job:
+                        job.status = "canceled"
+                        job.error = "canceled"
+                        job.ended_at = time.time()
+                        _canceled_jobs.add(job.id)
+                        log_event("job_canceled", job_id=job.id, task=job.task)
+                return
+            if _job_slots.acquire(timeout=0.1):
+                break
         with _jobs_lock:
             job = _jobs[self.job_id]
             job.status = "running"
@@ -294,6 +311,7 @@ class JobExecutor(threading.Thread):
                 index.set_cancel_event(None)
             except Exception:
                 pass
+            _job_slots.release()
 
     def _execute(self, task: str, params: Dict[str, Any]):  # noqa: C901
         directory = Path(params.get("directory", ".")).expanduser().resolve()
