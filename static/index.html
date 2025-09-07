@@ -14,7 +14,7 @@
         }
         document.documentElement.classList.add(mode === 'dark' ? 'theme-dark' : 'theme-light');
       } catch (_) {
-        // ignore
+        console.error('Error applying theme:', _);
       }
     })();
   </script>
