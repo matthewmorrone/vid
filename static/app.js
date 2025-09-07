@@ -1375,6 +1375,140 @@ async function _cancelJob(id, btn) {
 window.renderReport = renderReport;
 
 // ---------------------------------------------------------------------------
+// FaceLab exploration (gallery, scatterplot, clusters)
+// ---------------------------------------------------------------------------
+
+async function renderFaceLab(opts = {}) {
+  detachPlayerHotkeys();
+  const { containerId = 'view' } = opts;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+
+  const gallery = document.createElement('div');
+  gallery.id = 'facelab-gallery';
+  gallery.style.display = 'flex';
+  gallery.style.flexWrap = 'wrap';
+  gallery.style.gap = '4px';
+
+  const scatter = document.createElement('div');
+  scatter.id = 'facelab-scatter';
+
+  const clusters = document.createElement('div');
+  clusters.id = 'facelab-clusters';
+  clusters.style.marginTop = '10px';
+
+  container.appendChild(gallery);
+  container.appendChild(scatter);
+  container.appendChild(clusters);
+
+  let listing = { people: [] };
+  try {
+    const resp = await fetch('/faces/listing');
+    if (resp.ok) listing = await resp.json();
+  } catch (err) {
+    console.error('Failed to load face listing', err);
+  }
+
+  // Scatterplot (simple 2D projection using first two embedding dims)
+  const canvas = document.createElement('canvas');
+  canvas.width = 400;
+  canvas.height = 300;
+  scatter.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,255,0.6)';
+
+  listing.people.forEach(person => {
+    const emb = person.embedding || [0, 0];
+    const x = ((emb[0] || 0) * 0.5 + 0.5) * canvas.width;
+    const y = ((emb[1] || 0) * 0.5 + 0.5) * canvas.height;
+    ctx.fillRect(x - 2, y - 2, 4, 4);
+
+    // Gallery item
+    const item = document.createElement('div');
+    item.className = 'facelab-item';
+    item.style.border = '1px solid #ccc';
+    item.style.padding = '2px 4px';
+    item.textContent = person.performer || person.id;
+    gallery.appendChild(item);
+
+    // Cluster panel item with controls
+    const row = document.createElement('div');
+    row.className = 'facelab-cluster-row';
+    row.style.marginBottom = '4px';
+    const title = document.createElement('span');
+    title.textContent = person.performer || person.id;
+    title.style.marginRight = '8px';
+    row.appendChild(title);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Performer';
+    input.style.marginRight = '4px';
+    row.appendChild(input);
+
+    const assignBtn = document.createElement('button');
+    assignBtn.textContent = 'Assign';
+    assignBtn.addEventListener('click', async () => {
+      const performer = input.value.trim();
+      if (!performer) return;
+      try {
+        await fetch('/faces/assign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: person.id, performer }),
+        });
+        showToast('Assigned');
+        title.textContent = performer;
+      } catch (e) {
+        showToast('Assign failed');
+      }
+    });
+    row.appendChild(assignBtn);
+
+    const mergeBtn = document.createElement('button');
+    mergeBtn.textContent = 'Merge';
+    mergeBtn.style.marginLeft = '4px';
+    mergeBtn.addEventListener('click', async () => {
+      const target = prompt('Merge into ID', person.id);
+      if (!target) return;
+      try {
+        await fetch('/faces/merge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target, sources: [person.id] }),
+        });
+        showToast('Merged');
+      } catch (e) {
+        showToast('Merge failed');
+      }
+    });
+    row.appendChild(mergeBtn);
+
+    const splitBtn = document.createElement('button');
+    splitBtn.textContent = 'Split';
+    splitBtn.style.marginLeft = '4px';
+    splitBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/faces/split', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: person.id }),
+        });
+        showToast('Split');
+      } catch (e) {
+        showToast('Split failed');
+      }
+    });
+    row.appendChild(splitBtn);
+
+    clusters.appendChild(row);
+  });
+}
+
+window.renderFaceLab = renderFaceLab;
+
+// ---------------------------------------------------------------------------
 // Random video navigation
 // ---------------------------------------------------------------------------
 

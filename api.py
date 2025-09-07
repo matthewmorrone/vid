@@ -100,6 +100,23 @@ ALLOWED_TASKS = {
     "codecs", "transcode", "report"
 }
 
+# In-memory face label assignments used by FaceLab
+_face_labels: Dict[str, str] = {}
+
+
+class FaceAssignRequest(BaseModel):
+    id: str
+    performer: str
+
+
+class FaceMergeRequest(BaseModel):
+    target: str
+    sources: List[str]
+
+
+class FaceSplitRequest(BaseModel):
+    id: str
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -860,11 +877,38 @@ def face_listing(directory: str = Query("."), recursive: bool = Query(False), sa
     try:
         data = json.loads(cache_file.read_text()) if cache_file.exists() else {"index": {"people": [], "videos": 0}}
         people = data.get("index", {}).get("people", [])
+        for p in people:
+            pid = p.get("id")
+            if pid in _face_labels:
+                p["performer"] = _face_labels[pid]
     except Exception:
         people = []
     total = len(people)
     slice_people = people[offset: offset + limit]
     return {"people": slice_people, "total": total, "offset": offset, "limit": limit, "videos": data.get("index", {}).get("videos", 0)}
+
+
+@app.post("/faces/assign")
+def faces_assign(payload: FaceAssignRequest):
+    _face_labels[payload.id] = payload.performer
+    return {"id": payload.id, "performer": payload.performer}
+
+
+@app.post("/faces/merge")
+def faces_merge(payload: FaceMergeRequest):
+    label = _face_labels.get(payload.target)
+    for sid in payload.sources:
+        if label:
+            _face_labels[sid] = label
+        else:
+            _face_labels.pop(sid, None)
+    return {"merged": [payload.target, *payload.sources]}
+
+
+@app.post("/faces/split")
+def faces_split(payload: FaceSplitRequest):
+    _face_labels.pop(payload.id, None)
+    return {"id": payload.id}
 
 
 @app.get("/report")
