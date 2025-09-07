@@ -23,6 +23,7 @@
 <body>
   <nav>
     <a href="/" id="nav-home">Home</a>
+    <a href="/stats" id="nav-stats">Stats</a>
     <a href="/report" id="nav-report">Artifacts</a>
     <a href="/settings" id="nav-settings">Settings</a>
   </nav>
@@ -41,6 +42,9 @@
       .register('/video/:name', ({ name }) => {
         renderPlayer(name, { autoplay: true });
       })
+      .register('/stats', () => {
+        renderStats({ containerId: 'view' });
+      })
       .register('/report', () => {
         renderReport({ containerId: 'view' });
       })
@@ -50,6 +54,10 @@
     document.getElementById('nav-home').addEventListener('click', e => {
       e.preventDefault();
       router.navigate('/');
+    });
+    document.getElementById('nav-stats').addEventListener('click', e => {
+      e.preventDefault();
+      router.navigate('/stats');
     });
     document.getElementById('nav-report').addEventListener('click', e => {
       e.preventDefault();
