@@ -457,7 +457,7 @@ class JobExecutor(threading.Thread):
             dest = Path(params.get("dest") or (src.parent / "_clips"))
             fmt = params.get("format", "mp4")
             dest.mkdir(parents=True, exist_ok=True)
-            out_files: list[str] = []
+            out_files: List[str] = []
             with _jobs_lock:
                 job = _jobs.get(self.job_id)
                 if job:
