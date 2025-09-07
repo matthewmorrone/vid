@@ -102,7 +102,7 @@ function detachPlayerHotkeys() {
   }
 }
 
-function openSidebar(video) {
+async function openSidebar(video) {
   let sidebar = document.getElementById('sidebar');
   if (!sidebar) {
     sidebar = document.createElement('div');
@@ -118,15 +118,159 @@ function openSidebar(video) {
     sidebar.style.padding = '10px';
     document.body.appendChild(sidebar);
   }
-  sidebar.innerHTML = `
-    <div style="display: flex; justify-content: space-between; align-items: center;">
-      <h3 style="margin: 0;">${video.name}</h3>
-      <button id="sidebar-close-btn" style="background: transparent; color: white; border: none; font-size: 1.5em; cursor: pointer;">&times;</button>
-    </div>
-  `;
-  const closeBtn = sidebar.querySelector('#sidebar-close-btn');
-  closeBtn.addEventListener('click', () => {
-    sidebar.remove();
+  sidebar.innerHTML = '';
+
+  let currentName = video.name;
+
+  const header = document.createElement('div');
+  header.style.display = 'flex';
+  header.style.justifyContent = 'space-between';
+  header.style.alignItems = 'center';
+
+  const titleInput = document.createElement('input');
+  titleInput.type = 'text';
+  titleInput.value = currentName;
+  titleInput.style.width = '80%';
+  header.appendChild(titleInput);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.id = 'sidebar-close-btn';
+  closeBtn.textContent = '\u00d7';
+  closeBtn.style.background = 'transparent';
+  closeBtn.style.color = 'white';
+  closeBtn.style.border = 'none';
+  closeBtn.style.fontSize = '1.5em';
+  closeBtn.style.cursor = 'pointer';
+  closeBtn.addEventListener('click', () => sidebar.remove());
+  header.appendChild(closeBtn);
+
+  sidebar.appendChild(header);
+
+  let tagData = { tags: [], performers: [], description: '' };
+  try {
+    const resp = await fetch(`/videos/${encodeURIComponent(currentName)}/tags`);
+    if (resp.ok) {
+      const d = await resp.json();
+      tagData = {
+        tags: d.tags || [],
+        performers: d.performers || [],
+        description: d.description || '',
+      };
+    }
+  } catch (err) {
+    console.error('Failed to fetch tags for video:', currentName, err);
+    // Optionally show UI feedback
+    const errorMsg = document.createElement('div');
+    errorMsg.textContent = 'Failed to load tags for this video.';
+    errorMsg.style.color = 'red';
+    errorMsg.style.marginBottom = '10px';
+    sidebar.insertBefore(errorMsg, sidebar.firstChild);
+  }
+
+  const descLabel = document.createElement('label');
+  descLabel.textContent = 'Description:';
+  const descInput = document.createElement('textarea');
+  descInput.value = tagData.description || '';
+  descInput.style.width = '100%';
+  descLabel.appendChild(descInput);
+  sidebar.appendChild(descLabel);
+
+  const tagsLabel = document.createElement('label');
+  tagsLabel.textContent = 'Tags:';
+  const tagsInput = document.createElement('input');
+  tagsInput.type = 'text';
+  tagsInput.value = (tagData.tags || []).join(', ');
+  tagsInput.style.width = '100%';
+  tagsLabel.appendChild(tagsInput);
+  sidebar.appendChild(tagsLabel);
+
+  const perfLabel = document.createElement('label');
+  perfLabel.textContent = 'Performers:';
+  const perfInput = document.createElement('input');
+  perfInput.type = 'text';
+  perfInput.value = (tagData.performers || []).join(', ');
+  perfInput.style.width = '100%';
+  perfLabel.appendChild(perfInput);
+  sidebar.appendChild(perfLabel);
+
+  function splitList(str) {
+    return (str || '').split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  async function patchTags(payload, field) {
+    try {
+      const resp = await fetch(`/videos/${encodeURIComponent(currentName)}/tags`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) throw new Error('Failed to update tags');
+      field.dataset.retry = '';
+      return true;
+    } catch (err) {
+      field.dataset.retry = '1';
+      showToast('Update failed');
+      return false;
+    }
+  }
+
+  descInput.addEventListener('blur', async () => {
+    const val = descInput.value;
+    if (descInput.dataset.retry !== '1' && val === tagData.description) return;
+    const ok = await patchTags({ description: val }, descInput);
+    if (ok) tagData.description = val;
+  });
+
+  tagsInput.addEventListener('blur', async () => {
+    const newTags = splitList(tagsInput.value);
+    if (tagsInput.dataset.retry !== '1' && newTags.join(',') === (tagData.tags || []).join(',')) return;
+    const ok = await patchTags({ replace: true, add: newTags }, tagsInput);
+    if (ok) tagData.tags = newTags;
+  });
+
+  perfInput.addEventListener('blur', async () => {
+    const newPerfs = splitList(perfInput.value);
+    if (perfInput.dataset.retry !== '1' && newPerfs.join(',') === (tagData.performers || []).join(',')) return;
+    const payload = { performers_remove: tagData.performers, performers_add: newPerfs };
+    const ok = await patchTags(payload, perfInput);
+    if (ok) tagData.performers = newPerfs;
+  });
+
+  async function renameVideo(oldName, newName, field) {
+    try {
+      const resp = await fetch(`/videos/${encodeURIComponent(oldName)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_name: newName }),
+      });
+      if (!resp.ok) throw new Error('Failed to rename video');
+      currentName = newName;
+      field.value = newName;
+      field.dataset.retry = '';
+      showToast(`Renamed to ${newName}`, {
+        duration: 10000,
+        actionText: 'Undo',
+        onAction: () => renameVideo(newName, oldName, field),
+      });
+      return true;
+    } catch (err) {
+      field.dataset.retry = '1';
+      showToast('Rename failed');
+      return false;
+    }
+  }
+
+  titleInput.addEventListener('blur', () => {
+    const newName = titleInput.value.trim();
+    if (!newName || (titleInput.dataset.retry !== '1' && newName === currentName)) return;
+    if (newName !== currentName) {
+      const confirmed = window.confirm('Are you sure you want to rename the video?');
+      if (confirmed) {
+        renameVideo(currentName, newName, titleInput);
+      } else {
+        titleInput.value = currentName;
+      }
+    }
   });
 }
 
