@@ -1104,6 +1104,109 @@ async function renderPlayer(name, options = {}) {
 window.renderPlayer = renderPlayer;
 
 // ---------------------------------------------------------------------------
+// Stats dashboard
+// ---------------------------------------------------------------------------
+
+async function renderStats(opts = {}) {
+  detachPlayerHotkeys();
+  const { containerId = 'view', bucket = 'week' } = opts;
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.textContent = 'Loading...';
+  try {
+    const [metricsResp, chartsResp] = await Promise.all([
+      fetch('/stats/metrics'),
+      fetch(`/stats/chart_data?bucket=${encodeURIComponent(bucket)}`),
+    ]);
+    if (!metricsResp.ok || !chartsResp.ok) throw new Error('failed');
+    const metrics = await metricsResp.json();
+    const charts = await chartsResp.json();
+    container.textContent = '';
+
+    const grid = document.createElement('div');
+    grid.style.display = 'flex';
+    grid.style.flexWrap = 'wrap';
+    grid.style.gap = '10px';
+
+    const tiles = [
+      { label: 'Scenes Size', key: 'scenes_size' },
+      { label: 'Scenes', key: 'scenes' },
+      { label: 'Duration', key: 'duration' },
+      { label: 'Performers', key: 'performers' },
+      { label: 'Tags', key: 'tags' },
+      { label: 'Play counts', key: 'play_counts' },
+    ];
+
+    tiles.forEach(t => {
+      const card = document.createElement('div');
+      card.style.border = '1px solid #ccc';
+      card.style.padding = '8px';
+      card.style.minWidth = '150px';
+      const h = document.createElement('h3');
+      h.textContent = t.label;
+      h.style.margin = '0 0 4px 0';
+      const p = document.createElement('p');
+      p.textContent = metrics[t.key] != null ? String(metrics[t.key]) : '0';
+      p.style.margin = '0';
+      card.appendChild(h);
+      card.appendChild(p);
+      grid.appendChild(card);
+    });
+
+    container.appendChild(grid);
+
+    // Load Chart.js dynamically if not present
+    if (!window.Chart) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+
+    const chartsContainer = document.createElement('div');
+    chartsContainer.style.display = 'flex';
+    chartsContainer.style.flexDirection = 'column';
+    chartsContainer.style.gap = '20px';
+    chartsContainer.style.marginTop = '20px';
+
+    function addChart(title, info, type = 'line') {
+      const wrap = document.createElement('div');
+      const h = document.createElement('h3');
+      h.textContent = title;
+      const canvas = document.createElement('canvas');
+      wrap.appendChild(h);
+      wrap.appendChild(canvas);
+      chartsContainer.appendChild(wrap);
+
+      if (window.Chart && info && Array.isArray(info.labels) && Array.isArray(info.data)) {
+        new Chart(canvas.getContext('2d'), {
+          type,
+          data: {
+            labels: info.labels,
+            datasets: [{ label: title, data: info.data }],
+          },
+          options: { responsive: true, maintainAspectRatio: false },
+        });
+      }
+    }
+
+    addChart('Scenes Duration over time', charts.scenes_duration_over_time || {});
+    addChart('Total Play Count over time', charts.total_play_count_over_time || {});
+    addChart('Top Performers', charts.top_performers || {}, 'bar');
+
+    container.appendChild(chartsContainer);
+  } catch (err) {
+    console.error('Failed to load stats', err);
+    container.textContent = 'Failed to load';
+  }
+}
+
+window.renderStats = renderStats;
+
+// ---------------------------------------------------------------------------
 // Artifact coverage dashboard & job management
 // ---------------------------------------------------------------------------
 
