@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Media Library</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <script>
+    const theme = localStorage.getItem('theme') || 'dark';
+    document.body.classList.add(theme === 'light' ? 'theme-light' : 'theme-dark');
+  </script>
+  <nav class="top-nav">
+    <a href="/player" data-link>Player</a>
+    <a href="/grid" data-link>Grid</a>
+    <a href="/list" data-link>List</a>
+    <a href="/tasks" data-link>Tasks</a>
+    <a href="/settings" data-link>Settings</a>
+    <a href="/stats" data-link>Stats</a>
+    <a href="/random" data-link>Random</a>
+  </nav>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="content"></main>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

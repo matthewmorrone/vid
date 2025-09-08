@@ -34,7 +34,8 @@ import argparse
 from typing import Any, Dict, List, Optional, Callable
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -154,14 +155,18 @@ def build_artifact_info(path: Path) -> Dict[str, Dict[str, Any]]:
     """Return artifact paths/URLs alongside existence flags."""
     s, j = index.sprite_sheet_paths(path)
     subs_path = index.artifact_dir(path) / f"{path.stem}.srt"
+    thumb_p = index.thumbs_path(path)
+    legacy_thumb = path.with_suffix(".jpg")
+    thumb_exists = thumb_p.exists() or legacy_thumb.exists()
+    thumb_url = str(thumb_p if thumb_p.exists() else legacy_thumb)
     data: Dict[str, Dict[str, Any]] = {
         "metadata": {
             "url": str(index.metadata_path(path)),
             "exists": index.metadata_path(path).exists(),
         },
         "thumbs": {
-            "url": str(index.thumbs_path(path)),
-            "exists": index.thumbs_path(path).exists(),
+            "url": thumb_url,
+            "exists": thumb_exists,
         },
         "sprites": {
             "sheet": str(s),
@@ -968,6 +973,21 @@ async def job_events(job_id: str):
 
 
 # Run: uvicorn api:app --reload
+static_dir = Path(__file__).with_name("static")
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def spa_index() -> FileResponse:
+        return FileResponse(static_dir / "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_catch_all(full_path: str) -> FileResponse:
+        target = static_dir / full_path
+        if target.exists() and target.is_file():
+            return FileResponse(target)
+        return FileResponse(static_dir / "index.html")
+
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
